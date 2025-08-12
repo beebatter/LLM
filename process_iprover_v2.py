@@ -1,4 +1,5 @@
 """
+this is new version of process_iprover.py
 Utility script to convert iProver interactive mode logs into a format
 suitable for consumption by a Large Language Model (LLM).  The goal
 is to hide problem‑specific symbol names behind canonical identifiers
