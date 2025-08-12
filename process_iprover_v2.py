@@ -1214,35 +1214,73 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
                           chunk_size: int, anchors: int,
                           context_summary_k: int, summary_max_tokens: int,
                           dry_run: bool, progress: bool, verbose: bool,
-                          save_prompts: bool) -> Dict[int, float]:
-    import json, tempfile, subprocess, sys, os
-    with tempfile.TemporaryDirectory() as td:
-        in_path  = os.path.join(td, "iprover_llm_output.json")
-        out_path = os.path.join(td, "out_scores.json")
-        with open(in_path, "w", encoding="utf-8") as f:
+                          save_prompts: bool, artifacts_dir: Optional[str]) -> Dict[int, float]:
+    import json, tempfile, subprocess, sys, os, time, hashlib
+
+    def _mk_req_dir(base: str) -> str:
+        ts = int(time.time() * 1000)
+        cand_ids = [c.get('id') for c in batch.get('candidate_clauses', [])]
+        h = hashlib.sha1((','.join(map(str, cand_ids))).encode('utf-8')).hexdigest()[:8]
+        d = os.path.join(base, f"scores_req_{ts}_{len(cand_ids)}_{h}")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    if artifacts_dir:
+        req_dir = _mk_req_dir(artifacts_dir)
+        in_path  = os.path.join(req_dir, 'iprover_llm_output.json')
+        out_path = os.path.join(req_dir, 'out_scores.json')
+        with open(in_path, 'w', encoding='utf-8') as f:
             json.dump(batch, f, ensure_ascii=False)
         cmd = [
             sys.executable, ranker_script,
-            "--input", in_path,
-            "--out", out_path,
-            "--chunk-size", str(chunk_size),
-            "--anchors", str(anchors),
-            "--context-summary-k", str(context_summary_k),
-            "--summary-max-tokens", str(summary_max_tokens),
-            "--model", model,
+            '--input', in_path,
+            '--out', out_path,
+            '--chunk-size', str(chunk_size),
+            '--anchors', str(anchors),
+            '--context-summary-k', str(context_summary_k),
+            '--summary-max-tokens', str(summary_max_tokens),
+            '--model', model,
         ]
         if dry_run:
-            cmd.append("--dry-run")
+            cmd.append('--dry-run')
         if progress:
-            cmd.append("--progress")
+            cmd.append('--progress')
         if verbose:
-            cmd.append("--verbose")
+            cmd.append('--verbose')
         if save_prompts:
-            cmd.append("--save-prompts")
-        subprocess.run(cmd, check=True)
-        data = json.load(open(out_path, "r", encoding="utf-8"))
-        return {int(e["id"]): float(e["score"]) for e in data.get("scores", [])}
-
+            cmd.append('--save-prompts')
+        # 在 req_dir 下运行，确保 prompts/chunks 也写到该目录
+        subprocess.run(cmd, check=True, cwd=req_dir)
+        data = json.load(open(out_path, 'r', encoding='utf-8'))
+        print(f"[EA] artifacts saved under: {req_dir}")
+        return {int(e['id']): float(e['score']) for e in data.get('scores', [])}
+    else:
+        with tempfile.TemporaryDirectory() as td:
+            in_path  = os.path.join(td, 'iprover_llm_output.json')
+            out_path = os.path.join(td, 'out_scores.json')
+            with open(in_path, 'w', encoding='utf-8') as f:
+                json.dump(batch, f, ensure_ascii=False)
+            cmd = [
+                sys.executable, ranker_script,
+                '--input', in_path,
+                '--out', out_path,
+                '--chunk-size', str(chunk_size),
+                '--anchors', str(anchors),
+                '--context-summary-k', str(context_summary_k),
+                '--summary-max-tokens', str(summary_max_tokens),
+                '--model', model,
+            ]
+            if dry_run:
+                cmd.append('--dry-run')
+            if progress:
+                cmd.append('--progress')
+            if verbose:
+                cmd.append('--verbose')
+            if save_prompts:
+                cmd.append('--save-prompts')
+            subprocess.run(cmd, check=True)
+            data = json.load(open(out_path, 'r', encoding='utf-8'))
+            return {int(e['id']): float(e['score']) for e in data.get('scores', [])}
 
 def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=None) -> Dict[str, Any]:
     req_ids = [int(i) for i in msg.get("clause_ids", [])]
@@ -1267,6 +1305,7 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
         progress=args.progress,
         verbose=args.verbose,
         save_prompts=args.save_prompts,
+        artifacts_dir=args.artifacts_dir,
     )
     scores_list = [scores_map.get(cid, 0.0) for cid in req_ids]
     res = {"tag": "scores_res", "scores": scores_list}
@@ -1331,6 +1370,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_srv.add_argument('--ranker-script', type=str, default='/Users/songkunwei/Desktop/LLM/batch_ranker.py', help='Path to batch_ranker.py')
     p_srv.add_argument('--model', type=str, default='gpt-5', help='LLM model for ranking (passed to ranker)')
     p_srv.add_argument('--chunk-size', type=int, default=64)
+    p_srv.add_argument('--artifacts-dir', type=str, default=None,
+                   help='If set, persist each scores_req artifacts (input batch, prompts if --save-prompts, out_scores.json) under this directory')
     p_srv.add_argument('--anchors', type=int, default=8)
     p_srv.add_argument('--context-summary-k', type=int, default=64)
     p_srv.add_argument('--summary-max-tokens', type=int, default=500)
