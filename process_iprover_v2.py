@@ -956,10 +956,14 @@ def build_canonical_dataset(
             conjecture_entry = (cid, info)
             break
     # Determine context clause IDs in order of registration, excluding conjecture
+    # and excluding any IDs explicitly requested for scoring (to avoid starving candidates)
     register_order = list(clauses.keys())
+    requested = set(clause_ids)
     context_ids: List[int] = []
     for cid in register_order:
         if conjecture_entry is not None and cid == conjecture_entry[0]:
+            continue
+        if cid in requested:
             continue
         context_ids.append(cid)
         if len(context_ids) >= context_size:
@@ -1128,43 +1132,248 @@ def build_canonical_dataset(
     }
 
 
-def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Canonicalise iProver interactive log for LLM input")
-    parser.add_argument('--raw-log', type=str, required=True, help="Path to iprover_raw.log")
-    parser.add_argument('--context-size', type=int, default=128, help="Number of context clauses to include")
-    parser.add_argument('--candidate-size', type=int, default=128, help="Number of candidate clauses to score")
-    parser.add_argument('--mapping-scope', type=str, default='all', choices=['all', 'batch'], help="Build symbol mapping on all registered clauses or only on the selected batch")
-    parser.add_argument('--output', type=str, default='json', choices=['json', 'pretty'], help="Output format")
-    parser.add_argument('--include-ast', action='store_true', help='Include canonical_formula_ast in JSON output (omitted by default)')
-    args = parser.parse_args(argv)
-    clauses, clause_ids, component = parse_raw_log(args.raw_log)
-    dataset = build_canonical_dataset(
-        clauses, clause_ids, args.context_size, args.candidate_size,
-        mapping_scope=args.mapping_scope, component=component,
-        include_ast=args.include_ast
+def make_batch_for_scores_req(
+    all_clauses: Dict[int, Dict],
+    req_ids: List[int],
+    context_size: int = 128,
+    mapping_scope: str = 'batch',
+    include_ast: bool = False,
+    component: Optional[str] = None,
+) -> Dict:
+    """Build a canonical batch tailored for a single scores_req interaction.
+
+    Ensures the context never overlaps requested IDs and that all requested IDs
+    appear in the candidate set (no truncation).
+    """
+    return build_canonical_dataset(
+        clauses=all_clauses,
+        clause_ids=req_ids,
+        context_size=context_size,
+        candidate_size=len(req_ids),
+        mapping_scope=mapping_scope,
+        component=component,
+        include_ast=include_ast,
     )
-    if args.output == 'json':
-        with open('iprover_llm_output.json', 'w', encoding='utf-8') as f:
-            json.dump(dataset, f, indent=2, ensure_ascii=False)
-        print("输出已保存到 iprover_llm_output.json")
-    else:
-        # Pretty format: print mapping and a few clauses
-        print("Symbol mapping:")
-        for canon, info in sorted(dataset['symbol_map'].items()):
-            originals = ', '.join(info['original'])
-            kind = info.get('kind')
-            arity = info.get('arity')
-            print(f"  {canon} (kind={kind}, arity={arity}): {originals}")
-        if dataset['conjecture']:
-            print("\nConjecture:")
-            conj = dataset['conjecture']
-            print(f"  ID {conj['id']}: {conj['canonical_formula']}")
-        print("\nContext clauses:")
-        for c in dataset['context_clauses'][:5]:
-            print(f"  ID {c['id']}: {c['canonical_formula']}")
-        print("\nCandidate clauses:")
-        for c in dataset['candidate_clauses'][:5]:
-            print(f"  ID {c['id']}: {c['canonical_formula']}")
+
+# ---------------------- Minimal interactive EA server (optional) ----------------------
+class _EAState:
+    def __init__(self):
+        self.clauses: Dict[int, Dict[str, Any]] = {}
+
+
+def _ea_iter_json_messages(conn):
+    import json
+    buf = b""
+    dec = json.JSONDecoder()
+    while True:
+        chunk = conn.recv(8192)
+        if not chunk:
+            break
+        buf += chunk
+        # First split by NUL terminator if present
+        parts = buf.split(b"\x00")
+        for part in parts[:-1]:
+            part = part.strip()
+            if part:
+                try:
+                    yield json.loads(part.decode("utf-8", errors="ignore"))
+                except Exception:
+                    pass
+        buf = parts[-1]
+        # Then try concatenated JSON without delimiters
+        s = buf.decode("utf-8", errors="ignore").lstrip()
+        while s:
+            try:
+                obj, end = dec.raw_decode(s)
+                yield obj
+                s = s[end:].lstrip()
+            except json.JSONDecodeError:
+                break
+        buf = s.encode("utf-8")
+
+
+def _ea_handle_register_clauses(state: _EAState, msg: Dict[str, Any], log_fp=None) -> None:
+    for entry in msg.get("clauses", []):
+        cid = int(entry["clause_id"])
+        raw = entry["clause"]
+        feats = entry.get("clause_features", {})
+        clean = preprocess_clause_str(raw)
+        formula = extract_formula_from_tcf(clean)
+        state.clauses[cid] = {
+            "raw_clause": raw,
+            "clean_clause": clean,
+            "formula": formula,
+            "features": feats,
+        }
+    if log_fp is not None:
+        log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+        log_fp.flush()
+
+
+def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
+                          chunk_size: int, anchors: int,
+                          context_summary_k: int, summary_max_tokens: int,
+                          dry_run: bool, progress: bool, verbose: bool,
+                          save_prompts: bool) -> Dict[int, float]:
+    import json, tempfile, subprocess, sys, os
+    with tempfile.TemporaryDirectory() as td:
+        in_path  = os.path.join(td, "iprover_llm_output.json")
+        out_path = os.path.join(td, "out_scores.json")
+        with open(in_path, "w", encoding="utf-8") as f:
+            json.dump(batch, f, ensure_ascii=False)
+        cmd = [
+            sys.executable, ranker_script,
+            "--input", in_path,
+            "--out", out_path,
+            "--chunk-size", str(chunk_size),
+            "--anchors", str(anchors),
+            "--context-summary-k", str(context_summary_k),
+            "--summary-max-tokens", str(summary_max_tokens),
+            "--model", model,
+        ]
+        if dry_run:
+            cmd.append("--dry-run")
+        if progress:
+            cmd.append("--progress")
+        if verbose:
+            cmd.append("--verbose")
+        if save_prompts:
+            cmd.append("--save-prompts")
+        subprocess.run(cmd, check=True)
+        data = json.load(open(out_path, "r", encoding="utf-8"))
+        return {int(e["id"]): float(e["score"]) for e in data.get("scores", [])}
+
+
+def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=None) -> Dict[str, Any]:
+    req_ids = [int(i) for i in msg.get("clause_ids", [])]
+    component = msg.get("component")
+    batch = make_batch_for_scores_req(
+        all_clauses=state.clauses,
+        req_ids=req_ids,
+        context_size=args.context_size,
+        mapping_scope="batch",
+        include_ast=False,
+        component=component,
+    )
+    scores_map = _ea_score_with_ranker(
+        batch=batch,
+        ranker_script=args.ranker_script,
+        model=args.model,
+        chunk_size=args.chunk_size,
+        anchors=args.anchors,
+        context_summary_k=args.context_summary_k,
+        summary_max_tokens=args.summary_max_tokens,
+        dry_run=args.dry_run,
+        progress=args.progress,
+        verbose=args.verbose,
+        save_prompts=args.save_prompts,
+    )
+    scores_list = [scores_map.get(cid, 0.0) for cid in req_ids]
+    res = {"tag": "scores_res", "scores": scores_list}
+    if log_fp is not None:
+        log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+        log_fp.write(json.dumps(res, ensure_ascii=False) + "\x00")
+        log_fp.flush()
+    return res
+
+
+def run_ea_server(host: str, port: int, args) -> None:
+    import socket, threading, json
+    state = _EAState()
+    log_fp = open(args.log_file, "a", encoding="utf-8") if getattr(args, 'log_file', None) else None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen(1)
+    print(f"[EA] listening on {host}:{port}")
+
+    def handle(conn, addr):
+        with conn:
+            print(f"[EA] connected from {addr}")
+            for msg in _ea_iter_json_messages(conn):
+                tag = msg.get("tag")
+                if tag == "register_clauses":
+                    _ea_handle_register_clauses(state, msg, log_fp)
+                elif tag == "scores_req":
+                    res = _ea_handle_scores_req(state, msg, args, log_fp)
+                    conn.sendall((json.dumps(res) + "\x00").encode("utf-8"))
+                elif tag == "server_queries_start":
+                    end = {"tag": "server_queries_end"}
+                    if log_fp is not None:
+                        log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+                        log_fp.write(json.dumps(end, ensure_ascii=False) + "\x00")
+                        log_fp.flush()
+                    conn.sendall((json.dumps(end) + "\x00").encode("utf-8"))
+                # passive_clauses / given_clause / simplified_clauses 等可选消息，此处无需回包
+
+    while True:
+        conn, addr = sock.accept()
+        threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Canonicalise iProver interactive log for LLM input OR run EA server")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # convert (original behavior)
+    p_conv = sub.add_parser("convert", help="Parse raw log -> canonical JSON (original mode)")
+    p_conv.add_argument('--raw-log', type=str, required=True, help="Path to iprover_raw.log")
+    p_conv.add_argument('--context-size', type=int, default=128, help="Number of context clauses to include")
+    p_conv.add_argument('--candidate-size', type=int, default=128, help="Number of candidate clauses to score")
+    p_conv.add_argument('--mapping-scope', type=str, default='all', choices=['all', 'batch'], help="Build symbol mapping on all registered clauses or only on the selected batch")
+    p_conv.add_argument('--output', type=str, default='json', choices=['json', 'pretty'], help="Output format")
+    p_conv.add_argument('--include-ast', action='store_true', help='Include canonical_formula_ast in JSON output (omitted by default)')
+
+    # serve (EA server)
+    p_srv = sub.add_parser("serve", help="Run EA server for iProver interactive mode")
+    p_srv.add_argument('--host', type=str, default='127.0.0.1')
+    p_srv.add_argument('--port', type=int, default=12345)
+    p_srv.add_argument('--ranker-script', type=str, default='/Users/songkunwei/Desktop/LLM/batch_ranker.py', help='Path to batch_ranker.py')
+    p_srv.add_argument('--model', type=str, default='gpt-5', help='LLM model for ranking (passed to ranker)')
+    p_srv.add_argument('--chunk-size', type=int, default=64)
+    p_srv.add_argument('--anchors', type=int, default=8)
+    p_srv.add_argument('--context-summary-k', type=int, default=64)
+    p_srv.add_argument('--summary-max-tokens', type=int, default=500)
+    p_srv.add_argument('--dry-run', action='store_true')
+    p_srv.add_argument('--progress', action='store_true')
+    p_srv.add_argument('--verbose', action='store_true')
+    p_srv.add_argument('--save-prompts', action='store_true')
+    p_srv.add_argument('--context-size', type=int, default=128, help='Context size used when building each batch for a scores_req')
+    p_srv.add_argument('--log-file', type=str, default=None, help='Append raw request/response JSON (NUL-separated) to this file')
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == 'convert':
+        clauses, clause_ids, component = parse_raw_log(args.raw_log)
+        dataset = build_canonical_dataset(
+            clauses, clause_ids, args.context_size, args.candidate_size,
+            mapping_scope=args.mapping_scope, component=component,
+            include_ast=args.include_ast
+        )
+        if args.output == 'json':
+            with open('iprover_llm_output.json', 'w', encoding='utf-8') as f:
+                json.dump(dataset, f, indent=2, ensure_ascii=False)
+            print("输出已保存到 iprover_llm_output.json")
+        else:
+            print("Symbol mapping:")
+            for canon, info in sorted(dataset['symbol_map'].items()):
+                originals = ', '.join(info['original'])
+                kind = info.get('kind')
+                arity = info.get('arity')
+                print(f"  {canon} (kind={kind}, arity={arity}): {originals}")
+            if dataset['conjecture']:
+                print("\nConjecture:")
+                conj = dataset['conjecture']
+                print(f"  ID {conj['id']}: {conj['canonical_formula']}")
+            print("\nContext clauses:")
+            for c in dataset['context_clauses'][:5]:
+                print(f"  ID {c['id']}: {c['canonical_formula']}")
+            print("\nCandidate clauses:")
+            for c in dataset['candidate_clauses'][:5]:
+                print(f"  ID {c['id']}: {c['canonical_formula']}")
+
+    elif args.cmd == 'serve':
+        run_ea_server(args.host, args.port, args)
 
 
 if __name__ == '__main__':
