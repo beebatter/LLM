@@ -48,6 +48,168 @@ def save_json(obj: Any, path: str) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 # ------------------------ Utilities ------------------------
+ # --------------------- Semantic helpers ---------------------
+
+_LIT_SPLIT_RE = re.compile(r"\|")
+_PRED_RE = re.compile(r"^(~)?\s*([A-Za-z]*P\d+)(?:/(\d+))?")
+
+def parse_literals(formula: str) -> List[Tuple[str, str]]:
+    """Return list of literals as tuples: (pol+pred, pred/arity).
+    Example: "~P4/2(V0,V1) | Q/1(V1)" -> [("-P4/2","P4/2"),("+Q/1","Q/1")]
+    Equality is tagged as "EQ/2" and counted as "+EQ/2" (polarityless here).
+    """
+    if not formula:
+        return []
+    lits = []
+    parts = [p.strip() for p in _LIT_SPLIT_RE.split(formula)] if "|" in formula else [formula.strip()]
+    for raw in parts:
+        if not raw:
+            continue
+        # crude equality detection
+        if "=" in raw and not raw.lstrip().startswith("~"):
+            lits.append(("+EQ/2", "EQ/2"))
+            continue
+        if "=" in raw and raw.lstrip().startswith("~"):
+            lits.append(("-EQ/2", "EQ/2"))
+            continue
+        m = _PRED_RE.match(raw)
+        if not m:
+            # fallback: try to find P#/arity anywhere
+            m2 = re.search(r"(P\d+)(?:/(\d+))?", raw)
+            if m2:
+                pred = m2.group(1)
+                ar = m2.group(2) or "?"
+                lits.append(("+%s/%s" % (pred, ar), f"{pred}/{ar}"))
+            continue
+        neg, pred, ar = m.groups()
+        ar = ar or "?"
+        pol = '-' if neg else '+'
+        lits.append((f"{pol}{pred}/{ar}", f"{pred}/{ar}"))
+    return lits
+
+def extract_goal_frontier(conjecture_formula: str) -> Dict[str, Any]:
+    lits = parse_literals(conjecture_formula)
+    pos = {p for pp, p in lits if pp.startswith('+')}
+    neg = {p for pp, p in lits if pp.startswith('-')}
+    preds = {p.split('/')[0] for p in (pos | neg)}
+    return {"pos": pos, "neg": neg, "preds": preds, "has_eq": ("EQ/2" in pos or "EQ/2" in neg)}
+
+def _candidate_pred_set(formula: str) -> Tuple[set, set, set]:
+    lits = parse_literals(formula)
+    pos = {p for pp, p in lits if pp.startswith('+')}
+    neg = {p for pp, p in lits if pp.startswith('-')}
+    preds = {p.split('/')[0] for p in (pos | neg)}
+    return pos, neg, preds
+
+def attach_sat_metrics(cands: List[Dict[str, Any]], sat_map: Dict[str, Any]) -> None:
+    """Attach _sat_support/_sat_pressure to candidate dicts, if available.
+    sat_map is expected to be {cid: [bool, ...]}.
+    """
+    if not isinstance(sat_map, dict):
+        return
+    for c in cands:
+        cid = int(c.get("id"))
+        vals = sat_map.get(str(cid)) or sat_map.get(cid) or []
+        try:
+            vals = [bool(v) for v in vals]
+        except Exception:
+            vals = []
+        n = len(vals)
+        support = (sum(1 for v in vals if v) / n) if n else None
+        pressure = (1.0 - support) if (support is not None) else None
+        if support is not None:
+            c["_sat_support"] = float(support)
+            c["_sat_pressure"] = float(pressure)
+            c["_sat_n"] = int(n)
+
+def semantic_tags_for_clause(c: Dict[str, Any], goal: Dict[str, Any]) -> List[str]:
+    f = c.get("features", {})
+    s = c.get("canonical_formula", "")
+    unit = ('|' not in s)
+    has_eq = ("=" in s) or ("EQ/2" in s)
+    pos, neg, preds = _candidate_pred_set(s)
+    # resolvable: opposite polarity predicate exists in goal frontier
+    resolvable = []
+    for p in pos:
+        if p in goal.get("neg", set()):
+            resolvable.append(p)
+    for p in neg:
+        if p in goal.get("pos", set()):
+            resolvable.append(p)
+    tags: List[str] = []
+    if unit:
+        tags.append("unit")
+    if has_eq:
+        tags.append("eq")
+    if f.get("horn"):
+        tags.append("horn")
+    if resolvable:
+        # keep at most 3 for brevity
+        short = ','.join(sorted(set(resolvable))[:3])
+        tags.append(f"resolvable:{short}")
+    # SAT metrics
+    if c.get("_sat_support") is not None:
+        tags.append(f"sat_support={c['_sat_support']:.2f}")
+    if c.get("_sat_pressure") is not None:
+        tags.append(f"sat_pressure={c['_sat_pressure']:.2f}")
+    # overlap with goal predicates (symbolic, polarity-agnostic) just for info, not scoring
+    ovlp = len(preds & goal.get("preds", set()))
+    tags.append(f"goal_pred_overlap={ovlp}")
+    return tags
+
+def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any]) -> None:
+    for c in cands:
+        c["_sem_tags"] = semantic_tags_for_clause(c, goal)
+
+def select_anchors_semantic(cands: List[Dict[str, Any]], A: int, goal: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if A <= 0:
+        return []
+    def score(c: Dict[str, Any]) -> Tuple:
+        tags = c.get("_sem_tags", [])
+        s = 0.0
+        s += 3.0 if any(t.startswith("resolvable:") and "unit" in tags for t in tags) else 0.0
+        s += 2.0 if any(t.startswith("resolvable:") for t in tags) else 0.0
+        s += 1.5 if "eq" in tags else 0.0
+        s += 1.0 if "horn" in tags else 0.0
+        s += 0.5 * float(c.get("_sat_pressure", 0.0))
+        # tie-breakers: shorter formula, lower max_func_arity
+        f = c.get("features", {})
+        return (
+            -s,
+            len(c.get("canonical_formula", "")),
+            f.get("max_func_arity", 99),
+        )
+    ranked = sorted(cands, key=score)
+    # take unique top A
+    seen = set()
+    out = []
+    for c in ranked:
+        if c["id"] in seen:
+            continue
+        out.append(c)
+        seen.add(c["id"])
+        if len(out) >= A:
+            break
+    return out
+
+def format_goal_frontier_text(goal: Dict[str, Any]) -> str:
+    pos = sorted(goal.get("pos", []))
+    neg = sorted(goal.get("neg", []))
+    lines = []
+    if pos:
+        lines.append("+ goals: " + ", ".join(pos[:12]))
+    if neg:
+        lines.append("- goals: " + ", ".join(neg[:12]))
+    if goal.get("has_eq"):
+        lines.append("= goals: EQ/2 (equality present)")
+    return "\n".join(lines) or "(empty)"
+
+def build_reasoning_rules_text() -> str:
+    return (
+        "Resolution: if ~P(t) is in clause C and P(s) is in a goal clause and t unifies s, resolve to eliminate P.\n"
+        "Superposition/Demodulation: if l=r is available and l matches a subterm in a goal/clause, rewrite l→r to simplify.\n"
+        "Instantiation (Horn): if A1 & ... & Ak -> B and B unifies a goal, then A1..Ak become subgoals."
+    )
 
 SCHEMA = {
     "type": "object",
@@ -123,34 +285,44 @@ def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: Lis
     只输出摘要正文，不要额外说明。
     """.strip()
 
-def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]]) -> str:
-    lines = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in chunk)
+def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str) -> str:
+    def _line(c: Dict[str, Any]) -> str:
+        tags = c.get("_sem_tags", [])
+        tag_str = ", ".join(tags) if tags else ""
+        return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
+    lines = "\n".join(_line(c) for c in chunk)
     return f"""
-你是 ATP 子句打分器。任务：对下面子句按“与猜想能否推进证明”的相关性打分。
+你是 ATP 子句打分器。请基于**推理可用性**而非“频度/重合度/长度”对候选打分。
 - **分值范围**：0–10 的实数，至少保留两位小数；
-- **分布要求**：避免集中在固定档位（如 0、5、10），请输出**连续分布**以体现细微差异；
-- 使用**ONLY** 提供的 canonical 名称（P#/arity, F#/arity, C#），结合摘要中的 scoring_heuristics 与 derivation_patterns；
-- 偏好：Horn / EPR、与猜想符号高重叠、能与摘要模式组合产生新结论、与重要谓词相关的等式；
-- **并列打破顺序**（仅当分值相同）：
-  1) conj_dist 更小者优先；
+- **评分依据（只允许这些）**：
+  1) 与【目标前沿】的可解性（resolvable:*），是否能一跳解析/关闭；
+  2) 等式可重写潜力（eq + rewrite 直觉）；
+  3) Horn 规则可实例化潜力（horn）；
+  4) SAT 观测（sat_support / sat_pressure）仅作**微调**，不得喧宾夺主；
+- **禁止理由**：符号出现频率、表面重合度、字符串长度等统计量。
+- **并列打破顺序**（仅当分值恰好相同）：
+  1) unit 且 resolvable 优先；
   2) 文字数（lit_count）更少者优先；
   3) max_func_arity 更低者优先；
-  4) Horn 优先其余；EPR 优先非 EPR；
+  4) Horn 优先；EPR 优先；
   5) canonical_formula 更短者优先。
 
-只输出 JSON，禁止任何解释；JSON schema 如下（scores 是数组，元素是 {{id, score}}）：
-{json.dumps(SCHEMA, ensure_ascii=False)}
+【目标前沿（抽象）】
+{goal_text}
 
-【背景摘要(全局共享】:
+【推理规则（参考）】
+{rules_text}
+
+【背景摘要（全局共享）】
 {summary}
 
-【符号速查表(节选)】:
+【符号速查表（节选）】
 {cheatsheet}
 
-【猜想】:
+【猜想】
 {conjecture_formula}
 
-【待评分子句】:
+【待评分子句（每条含 tags + 公式）】
 {lines}
 """.strip()
 
@@ -221,6 +393,8 @@ class LLMClient:
         self.dry_run = dry_run
         self.max_retries = max_retries
         self.verbose = verbose
+        self._goal_text = ""
+        self._rules_text = ""
         # Auto-fix temperature for models that require default=1
         if ("gpt-5" in self.model) and (not self.dry_run) and (temperature != 1.0):
             self.temperature = 1.0
@@ -285,12 +459,16 @@ class LLMClient:
                 time.sleep(1.0)
         raise RuntimeError(f"LLM request failed after retries: {last_err}")
 
+    def set_reasoning_context(self, goal_text: str, rules_text: str) -> None:
+        self._goal_text = goal_text
+        self._rules_text = rules_text
+
     def summarize(self, conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
         prompt = build_summary_prompt(conjecture_formula, cheatsheet, ctx_list, max_tokens)
         return self._chat(prompt)
 
     def score_chunk(self, summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]]) -> Dict[str, Any]:
-        prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk)
+        prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk, self._goal_text, self._rules_text)
         text = self._chat(prompt)
         obj = extract_json(text)
         if not obj or "scores" not in obj:
@@ -366,6 +544,8 @@ def main():
     conj = ds.get("conjecture")
     ctx = ds.get("context_clauses", [])
     cands = ds.get("candidate_clauses", [])
+    eqf: Dict[str, Any] = ds.get("ea_query_features", {}) or {}
+    sat_map: Dict[str, Any] = eqf.get("sat_lit_gr_vals", {}) or {}
 
     if args.verbose:
         print(f"[DEBUG] clauses: context={len(ctx)}, candidates={len(cands)}")
@@ -397,9 +577,27 @@ def main():
     if args.progress:
         print("[LLM] Summary ready.")
 
-    # anchors: top by overlap (shorter clause first)
+    # Semantic helpers: compute goal frontier, rules, attach SAT metrics & semantic tags, set LLM context
+    conj_formula = conj.get("canonical_formula", "")
+    goal = extract_goal_frontier(conj_formula)
+    goal_text = format_goal_frontier_text(goal)
+    rules_text = build_reasoning_rules_text()
+
+    # attach SAT metrics (if any) and compute semantic tags
+    attach_sat_metrics(cands, sat_map)
+    compute_and_attach_sem_tags(cands, goal)
+
+    # Provide reasoning context to the client
+    llm.set_reasoning_context(goal_text, rules_text)
+
+    # anchors: semantic anchor selection with fallback
     A = max(0, int(args.anchors))
-    anchors = sorted(cands, key=lambda c: (-c.get("_ovlp", 0.0), len(c.get("canonical_formula", ""))))[:A]
+    anchors = select_anchors_semantic(cands, A, goal)
+    if len(anchors) < A:
+        # fallback to previous overlap-based anchors to fill remaining slots
+        rest = [c for c in cands if c not in anchors]
+        extra = sorted(rest, key=lambda c: (-c.get("_ovlp", 0.0), len(c.get("canonical_formula", ""))))[:(A - len(anchors))]
+        anchors = anchors + extra
     anchor_ids = [a["id"] for a in anchors]
 
     # chunking
@@ -419,14 +617,14 @@ def main():
     for idx, ch in enumerate(chunks):
         if args.progress:
             print(f"[LLM] Scoring chunk {idx+1}/{len(chunks)} (size={len(ch)})...")
-        prompt = build_scoring_prompt(summary, cheatsheet, conj.get("canonical_formula", ""), ch)
+        prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text, rules_text)
         if args.save_prompts:
             with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
                 pf.write(prompt)
         if args.verbose:
             ids_in_prompt = [int(m) for m in re.findall(r"ID\s+(\d+)", prompt)]
             print(f"[DEBUG] chunk_{idx:03d}: ids_in_prompt={len(ids_in_prompt)}")
-        res = llm.score_chunk(summary, cheatsheet, conj.get("canonical_formula", ""), ch)
+        res = llm.score_chunk(summary, cheatsheet, conj_formula, ch)
         if args.progress:
             print(f"[LLM]   -> received {len(res.get('scores', []))} scores.")
         save_json(res, os.path.join(chunk_dir, f"chunk_{idx:03d}.json"))
