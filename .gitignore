@@ -1,5 +1,9 @@
-./chunks
+# 忽略文件夹
+chunks/
+ea_runs/
+Logs/
+.idea/
+.venv/
 
-./iprover_llm_output.json
-./iprover_raw.log
-./out_scores.json
+# 忽略文件
+ea_exchange.log
