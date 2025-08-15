@@ -1159,6 +1159,12 @@ def make_batch_for_scores_req(
 class _EAState:
     def __init__(self):
         self.clauses: Dict[int, Dict[str, Any]] = {}
+        # Store the last pending scores_req until server_queries_start arrives
+        self.pending_scores: Optional[Dict[str, Any]] = None
+        # Latest SAT ground literal evaluations keyed by clause id
+        self.last_sat_eval: Dict[int, List[bool]] = {}
+        # Last SAT solver exec result ("sat"/"unsat"), if requested
+        self.last_sat_result: Optional[str] = None
 
 
 def _ea_iter_json_messages(conn):
@@ -1293,6 +1299,14 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
         include_ast=False,
         component=component,
     )
+    # Thread optional EA-query features (e.g., SAT ground literal evaluations) into the batch
+    if getattr(args, 'include_sat_eval', False) and getattr(state, 'last_sat_eval', None):
+        # Keep a compact mapping cid -> list[bool]
+        batch.setdefault('ea_query_features', {})['sat_lit_gr_vals'] = {
+            int(cid): list(vals) for cid, vals in state.last_sat_eval.items()
+        }
+    if getattr(state, 'last_sat_result', None) is not None:
+        batch.setdefault('ea_query_features', {})['sat_solver_exec_result'] = state.last_sat_result
     scores_map = _ea_score_with_ranker(
         batch=batch,
         ranker_script=args.ranker_script,
@@ -1334,15 +1348,67 @@ def run_ea_server(host: str, port: int, args) -> None:
                 if tag == "register_clauses":
                     _ea_handle_register_clauses(state, msg, log_fp)
                 elif tag == "scores_req":
-                    res = _ea_handle_scores_req(state, msg, args, log_fp)
-                    conn.sendall((json.dumps(res) + "\x00").encode("utf-8"))
+                    if getattr(args, 'use_server_queries', False):
+                        # Optional: reset old SAT evals when a new scores_req arrives
+                        state.last_sat_eval = {}
+                        state.last_sat_result = None
+                        # Defer scoring until we finish the optional query window
+                        state.pending_scores = {
+                            "req_ids": [int(i) for i in msg.get("clause_ids", [])],
+                            "component": msg.get("component"),
+                            "component_id": msg.get("component_id"),
+                        }
+                        if log_fp is not None:
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+                            log_fp.flush()
+                    else:
+                        res = _ea_handle_scores_req(state, msg, args, log_fp)
+                        conn.sendall((json.dumps(res) + "\x00").encode("utf-8"))
                 elif tag == "server_queries_start":
+                    if getattr(args, 'use_server_queries', False) and state.pending_scores:
+                        # Ask iProver to evaluate the current candidates against its SAT model
+                        q = {"tag": "cls_sat_eval_gr_req", "clause_ids": state.pending_scores["req_ids"]}
+                        if log_fp is not None:
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+                            log_fp.write(json.dumps(q, ensure_ascii=False) + "\x00")
+                            log_fp.flush()
+                        conn.sendall((json.dumps(q) + "\x00").encode("utf-8"))
+                        # We will send server_queries_end and scores_res once we receive the corresponding *_res
+                    else:
+                        end = {"tag": "server_queries_end"}
+                        if log_fp is not None:
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+                            log_fp.write(json.dumps(end, ensure_ascii=False) + "\x00")
+                            log_fp.flush()
+                        conn.sendall((json.dumps(end) + "\x00").encode("utf-8"))
+                elif tag == "cls_sat_eval_gr_res":
+                    # Some older builds use a typo 'cause_ids' — fall back if needed
+                    ids = msg.get("clause_ids") or msg.get("cause_ids") or []
+                    try:
+                        cids = [int(x) for x in ids]
+                    except Exception:
+                        cids = []
+                    vals = msg.get("sat_lit_gr_vals", []) or []
+                    state.last_sat_eval = {cid: (vals[i] if i < len(vals) else []) for i, cid in enumerate(cids)}
+                    # Finish the query window
                     end = {"tag": "server_queries_end"}
                     if log_fp is not None:
-                        log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
                         log_fp.write(json.dumps(end, ensure_ascii=False) + "\x00")
                         log_fp.flush()
                     conn.sendall((json.dumps(end) + "\x00").encode("utf-8"))
+                    # Now score and respond to the earlier scores_req
+                    if state.pending_scores:
+                        pend = state.pending_scores
+                        # Synthesize a scores_req message so we can reuse the handler
+                        msg2 = {
+                            "tag": "scores_req",
+                            "clause_ids": pend["req_ids"],
+                            "component": pend.get("component"),
+                            "component_id": pend.get("component_id"),
+                        }
+                        res = _ea_handle_scores_req(state, msg2, args, log_fp)
+                        conn.sendall((json.dumps(res) + "\x00").encode("utf-8"))
+                        state.pending_scores = None
                 # passive_clauses / given_clause / simplified_clauses 等可选消息，此处无需回包
 
     while True:
@@ -1379,6 +1445,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_srv.add_argument('--progress', action='store_true')
     p_srv.add_argument('--verbose', action='store_true')
     p_srv.add_argument('--save-prompts', action='store_true')
+    p_srv.add_argument('--use-server-queries', action='store_true',
+                       help='Between scores_req and scores_res, request cls_sat_eval_gr from iProver and feed results into the ranker')
+    p_srv.add_argument('--include-sat-eval', dest='include_sat_eval', action='store_true',
+                       help='Include cls_sat_eval_gr results in batch JSON as ea_query_features.sat_lit_gr_vals')
     p_srv.add_argument('--context-size', type=int, default=128, help='Context size used when building each batch for a scores_req')
     p_srv.add_argument('--log-file', type=str, default=None, help='Append raw request/response JSON (NUL-separated) to this file')
 
