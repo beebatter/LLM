@@ -321,7 +321,15 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
   2) 等式可重写潜力（eq + rewrite 直觉）；
   3) Horn 规则可实例化潜力（horn）；
   4) SAT 观测（sat_support / sat_pressure）仅作**微调**，不得喧宾夺主；
-- **禁止理由**：符号出现频率、表面重合度、字符串长度等统计量。
+- **硬性规则（Bridge 约束）**：
+  A) 若候选至少一侧可与猜想目标项**直接统一**或能被等式**一跳重写**到目标式样，显著加分；
+  B) 若候选仅为 `F*/... =/!= C*` 这类“等于常量/不等于常量”，且看不到把目标项一跳桥接到该常量的规则链，则强烈降权（此类通常偏题）；
+  C) 等式方向优先：能让目标项**复杂→简单**、或消顶符号/合一参数者优先。
+- **分档指引（用于拉开分数）**：
+  9–10：可与目标一侧直接互补/解析，或一跳重写/实例化即可推进；
+  7–8：Horn 结论可统一目标（前提短），或具备多个有效重写位点；
+  4–6：间接相关（需≥2步桥接）或弱重写；
+  0–3：与目标两侧**无桥接**，或纯 `...=/!=常量` 且无可见桥接。
 - **并列打破顺序**（仅当分值恰好相同）：
   1) unit 且 resolvable 优先；
   2) 文字数（lit_count）更少者优先；
@@ -540,6 +548,119 @@ def normalize_and_align(chunks_json: List[Dict[str, Any]], anchor_ids: List[int]
         for cid, v in al.items():
             bag[cid].append(v)
     return {cid: sum(v)/len(v) for cid, v in bag.items()}
+
+
+# ---------------------- Calibration & Jitter ----------------------
+
+def _fun_keys(local_symbols: Dict[str, Any]) -> set:
+    if not isinstance(local_symbols, dict):
+        return set()
+    return {k for k in local_symbols.keys() if isinstance(k, str) and k.startswith("F")}
+
+def _pred_overlap_count(formula: str, goal: Dict[str, Any]) -> int:
+    pos, neg, preds = _candidate_pred_set(formula or "")
+    return len(preds & goal.get("preds", set()))
+
+def calibrate_scores(
+    raw_scores: Dict[int, float],
+    id2clause: Dict[int, Dict[str, Any]],
+    goal: Dict[str, Any],
+    conj_fun_syms: set,
+    scale_hi: float = 100.0,
+    penalty_offtarget_eq: float = 0.2,
+    bump_resolvable: float = 0.6,
+    bump_unit: float = 0.4,
+    bump_horn: float = 0.3,
+    bump_fun_overlap: float = 0.2,
+) -> Tuple[Dict[int, float], Dict[str, Any]]:
+    """Min-max scale to [0,scale_hi], penalize off-target eq-only clauses with no bridge,
+    and add small positive bumps for semantically useful tags. Return (scaled_scores, stats)."""
+    if not raw_scores:
+        return {}, {"note": "empty"}
+
+    vals = list(raw_scores.values())
+    pre_min = min(vals); pre_max = max(vals)
+    pre_mean = sum(vals) / len(vals)
+
+    # Min-max scaling
+    scaled: Dict[int, float] = {}
+    if pre_max - pre_min > 1e-12:
+        for cid, v in raw_scores.items():
+            scaled[cid] = (v - pre_min) / (pre_max - pre_min) * scale_hi
+    else:
+        # Flat case: start everyone from the midpoint; later jitter will separate.
+        mid = 0.5 * scale_hi
+        scaled = {cid: mid for cid in raw_scores.keys()}
+
+    penalized = 0
+    bumped = 0
+
+    for cid, s in list(scaled.items()):
+        c = id2clause.get(cid, {})
+        formula = c.get("canonical_formula", "") or ""
+        tags = c.get("_sem_tags", []) or []
+        loc = c.get("local_symbols", {}) or {}
+
+        has_eq = ("=" in formula)
+        fun_ovlp = len(_fun_keys(loc) & conj_fun_syms)
+        pred_ovlp = _pred_overlap_count(formula, goal)
+
+        # Off-target eq: equality present, but neither goal predicates nor conjecture functions overlap
+        if has_eq and fun_ovlp == 0 and pred_ovlp == 0:
+            s *= penalty_offtarget_eq
+            penalized += 1
+
+        # Positive micro-bumps (small; only for ordering and to help external_score distinguish)
+        bump = 0.0
+        if any(isinstance(t, str) and t.startswith("resolvable:") for t in tags):
+            bump += bump_resolvable
+        if "unit" in tags:
+            bump += bump_unit
+        if "horn" in tags:
+            bump += bump_horn
+        if fun_ovlp > 0:
+            bump += bump_fun_overlap
+        if bump:
+            s += bump
+            bumped += 1
+
+        scaled[cid] = float(s)
+
+    post_vals = list(scaled.values())
+    post_min = min(post_vals); post_max = max(post_vals)
+    post_mean = sum(post_vals) / len(post_vals)
+
+    stats = {
+        "pre_min": pre_min, "pre_max": pre_max, "pre_mean": pre_mean,
+        "post_min": post_min, "post_max": post_max, "post_mean": post_mean,
+        "penalized_offtarget_eq": penalized, "bumped_semantic": bumped,
+        "scale_hi": scale_hi,
+    }
+    return scaled, stats
+
+def apply_groupwise_jitter(sorted_items: List[Tuple[int, float]], eps: float = 1e-6) -> List[Tuple[int, float]]:
+    """Within groups of (nearly) equal scores, add decreasing tiny jitter so numbers are strictly ordered.
+    `sorted_items` must already be in the desired final order (after tie-break rules)."""
+    if not sorted_items:
+        return sorted_items
+    out: List[Tuple[int, float]] = []
+    i = 0
+    n = len(sorted_items)
+    while i < n:
+        j = i + 1
+        base = sorted_items[i][1]
+        # find group with almost equal scores
+        while j < n and abs(sorted_items[j][1] - base) <= 1e-12:
+            j += 1
+        # apply jitter within [i, j)
+        group = sorted_items[i:j]
+        g = len(group)
+        for k, (cid, sc) in enumerate(group):
+            # earlier items (better by tie-break) get slightly higher jitter
+            jittered = sc + eps * (g - k)
+            out.append((cid, jittered))
+        i = j
+    return out
 
 # --------------------------- Main ---------------------------
 
@@ -788,10 +909,22 @@ def main():
         return
 
     final_scores = normalize_and_align(chunk_results, anchor_ids)
-
-    # Build an index from clause id -> clause (context + candidates) for tie-breaking
+    # Build id -> clause map (context + candidates) for calibration and tie-breaking
     id2clause: Dict[int, Dict[str, Any]] = {c["id"]: c for c in ctx}
     id2clause.update({c["id"]: c for c in cands})
+
+    # Conjecture-side function symbols for bridge checks
+    conj_fun_syms = {k for k in (conj.get("local_symbols", {}) or {}).keys() if isinstance(k, str) and k.startswith("F")}
+
+    # Calibrate scores to a wide numeric range and apply semantic adjustments
+    calibrated_scores, calib_stats = calibrate_scores(final_scores, id2clause, goal, conj_fun_syms)
+    final_scores = calibrated_scores
+
+    if args.progress or args.verbose:
+        print(f"[SCALE] pre(min/mean/max)=({calib_stats['pre_min']:.4f}/{calib_stats['pre_mean']:.4f}/{calib_stats['pre_max']:.4f}) "
+              f"-> post(min/mean/max)=({calib_stats['post_min']:.2f}/{calib_stats['post_mean']:.2f}/{calib_stats['post_max']:.2f}); "
+              f"penalized(offtarget_eq)={calib_stats['penalized_offtarget_eq']}, bumped={calib_stats['bumped_semantic']}")
+
 
     def _tiebreak_tuple(cid: int, score: float):
         c = id2clause.get(cid, {})
@@ -806,9 +939,10 @@ def main():
         # Primary sort: score DESC; then: overlap DESC; conj_dist ASC; horn True first; epr True first; shorter clause first
         return (-score, -ovlp, conjd, hornp, eprp, clen)
 
-    # pack result with secondary tie-breaking
     ranking_items = [(int(cid), float(sc)) for cid, sc in final_scores.items()]
     ranking_items.sort(key=lambda kv: _tiebreak_tuple(kv[0], kv[1]))
+    # Make numeric scores strictly ordered within ties to help iProver's external_score
+    ranking_items = apply_groupwise_jitter(ranking_items, eps=1e-6)
 
     # If scores are degenerate (all equal or near-equal), spread them by rank to avoid all zeros reaching iProver.
     def _spread_if_degenerate(items):
@@ -844,6 +978,7 @@ def main():
                 "requested_anchors": requested_A,
                 "used_spread_fallback": used_spread_fallback,
                 "models_used": models_used,
+                "calibration": calib_stats,
             },
         },
         "conjecture_id": conj.get("id"),
