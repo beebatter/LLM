@@ -33,6 +33,8 @@ import random
 import re
 import time
 from collections import defaultdict
+import hashlib
+import shutil
 from statistics import mean, pstdev
 from typing import Dict, List, Tuple, Any
 
@@ -262,6 +264,26 @@ def build_symbol_cheatsheet(symbol_map: Dict[str, Any], keys: List[str], max_ite
         orig = ", ".join(info.get("original", []))
         rows.append(f"{k} ⇨ {orig}  ({info.get('kind')}, arity={info.get('arity')})")
     return "\n".join(rows)
+
+def _find_run_root(out_dir: str) -> str:
+    """Best-effort detection of the EA run root directory.
+    We expect args.out like: .../EA.<port>.<ts>/requests/scores_req_xxx/out_scores.json
+    Return the parent of 'requests' if found; otherwise return out_dir.
+    """
+    cur = os.path.abspath(out_dir)
+    # Limit the climb depth to avoid walking to filesystem root indefinitely
+    for _ in range(5):
+        base = os.path.basename(cur)
+        if base == "requests":
+            return os.path.dirname(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return os.path.abspath(out_dir)
+
+def _prompt_fingerprint(prompt_text: str) -> str:
+    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
 def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
     ctx_text = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in ctx_list[:80])
@@ -535,7 +557,8 @@ def main():
     ap.add_argument("--max-retries", type=int, default=3, help="LLM call retries")
     ap.add_argument("--dry-run", action="store_true", help="do not call API; generate mock scores")
     ap.add_argument("--verbose", action="store_true", help="print debug info about chunking and scoring")
-    ap.add_argument("--save-prompts", action="store_true", help="dump each scoring prompt to chunks/prompt_XXX.txt for debugging")
+    # save-prompts hard-wired on by default; keep the flag for compatibility but it is ignored
+    ap.add_argument("--save-prompts", action="store_true", help="(ignored; always on) dump prompts and raw responses to files")
     ap.add_argument("--progress", action="store_true", help="print live progress while LLM is running")
     args = ap.parse_args()
 
@@ -567,15 +590,66 @@ def main():
         used_keys |= set(c.get("local_symbols", {}).keys())
     cheatsheet = build_symbol_cheatsheet(sym_map, sorted(used_keys), max_items=args.cheatsheet_max_items)
 
-    # LLM client
-    llm = LLMClient(model=args.model, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
+    # Determine output base directory (hard-coded policy):
+    # If args.out has a directory (e.g., when invoked by EA under artifacts), use that.
+    # Otherwise, place under /home/ks/logs/Ranker.<pid>.<ts>/
+    out_dir = os.path.dirname(args.out) or "."
+    if out_dir == ".":
+        try:
+            run_base = f"/home/ks/LLM/Logs/Ranker.{os.getpid()}.{int(time.time())}"
+            os.makedirs(run_base, exist_ok=True)
+            args.out = os.path.join(run_base, os.path.basename(args.out))
+            out_dir = run_base
+        except Exception:
+            os.makedirs(out_dir, exist_ok=True)
 
-    if args.progress:
-        print("[LLM] Generating background summary...")
-    # summary once
-    summary = llm.summarize(conj.get("canonical_formula", ""), cheatsheet, sum_ctx, args.summary_max_tokens)
-    if args.progress:
-        print("[LLM] Summary ready.")
+    # LLM clients (primary + optional small-batch client)
+    llm = LLMClient(model=args.model, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
+    SMALL_BATCH_THRESHOLD = 17
+    # Use a standard chat-completions model, not a realtime model
+    SMALL_BATCH_MODEL = "gpt-4o-mini"
+    llm_small = None  # lazy init
+
+    # Background summary: cache per run using the exact prompt as the key
+    os.makedirs(out_dir, exist_ok=True)
+    summary_prompt = build_summary_prompt(conj.get("canonical_formula", ""), cheatsheet, sum_ctx, args.summary_max_tokens)
+    fp = _prompt_fingerprint(summary_prompt)
+    run_root = _find_run_root(out_dir)
+    cache_dir = os.path.join(run_root, "summary_cache", fp)
+    cached_resp_path = os.path.join(cache_dir, "summary_response.txt")
+    cached_prompt_path = os.path.join(cache_dir, "summary_prompt.txt")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    summary: str
+    if os.path.exists(cached_resp_path):
+        # Reuse cached summary and copy artifacts into current out_dir for convenience
+        with open(cached_resp_path, "r", encoding="utf-8") as f:
+            summary = f.read()
+        # Ensure cached prompt is present (for completeness)
+        if not os.path.exists(cached_prompt_path):
+            with open(cached_prompt_path, "w", encoding="utf-8") as f:
+                f.write(summary_prompt)
+        # Mirror to request directory
+        shutil.copyfile(cached_prompt_path, os.path.join(out_dir, "summary_prompt.txt"))
+        shutil.copyfile(cached_resp_path, os.path.join(out_dir, "summary_response.txt"))
+        if args.progress:
+            print("[LLM] Using cached background summary.")
+    else:
+        if args.progress:
+            print("[LLM] Generating background summary...")
+        # Save prompt to cache and out_dir
+        with open(cached_prompt_path, "w", encoding="utf-8") as sp:
+            sp.write(summary_prompt)
+        with open(os.path.join(out_dir, "summary_prompt.txt"), "w", encoding="utf-8") as sp2:
+            sp2.write(summary_prompt)
+        # Generate via LLM (or dry-run), then save in cache and out_dir
+        summary = llm.summarize(conj.get("canonical_formula", ""), cheatsheet, sum_ctx, args.summary_max_tokens)
+        with open(cached_resp_path, "w", encoding="utf-8") as sr:
+            sr.write(summary)
+        with open(os.path.join(out_dir, "summary_response.txt"), "w", encoding="utf-8") as sr2:
+            sr2.write(summary)
+        if args.progress:
+            print("[LLM] Summary ready.")
 
     # Semantic helpers: compute goal frontier, rules, attach SAT metrics & semantic tags, set LLM context
     conj_formula = conj.get("canonical_formula", "")
@@ -591,7 +665,10 @@ def main():
     llm.set_reasoning_context(goal_text, rules_text)
 
     # anchors: semantic anchor selection with fallback
-    A = max(0, int(args.anchors))
+    # Choose anchors conservatively for small candidate sets to avoid the "all anchors, empty pool" degenerate case.
+    # Effective anchors: at most len(cands)-1 so there's always some non-anchor payload (when possible).
+    requested_A = max(0, int(args.anchors))
+    A = min(requested_A, max(0, len(cands) - 1))
     anchors = select_anchors_semantic(cands, A, goal)
     if len(anchors) < A:
         # fallback to previous overlap-based anchors to fill remaining slots
@@ -609,22 +686,63 @@ def main():
             print(f"[DEBUG] chunk[0] size={len(chunks[0])} (payload+anchors)")
 
     # per-chunk scoring
-    out_dir = os.path.dirname(args.out) or "."
     chunk_dir = os.path.join(out_dir, "chunks")
     os.makedirs(chunk_dir, exist_ok=True)
 
     chunk_results: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks):
+        # Choose model based on chunk size
+        use_small = len(ch) < SMALL_BATCH_THRESHOLD
+        client = llm
+        if use_small:
+            if llm_small is None:
+                llm_small = LLMClient(model=SMALL_BATCH_MODEL, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
+                # ensure it has the same reasoning context
+                # (set below once goal_text/rules_text are available)
+            client = llm_small
         if args.progress:
-            print(f"[LLM] Scoring chunk {idx+1}/{len(chunks)} (size={len(ch)})...")
+            mdl = getattr(client, "model", "?")
+            print(f"[LLM] Scoring chunk {idx+1}/{len(chunks)} (size={len(ch)}) with model={mdl}...")
         prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text, rules_text)
-        if args.save_prompts:
-            with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
-                pf.write(prompt)
+        with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
+            pf.write(prompt)
         if args.verbose:
             ids_in_prompt = [int(m) for m in re.findall(r"ID\s+(\d+)", prompt)]
             print(f"[DEBUG] chunk_{idx:03d}: ids_in_prompt={len(ids_in_prompt)}")
-        res = llm.score_chunk(summary, cheatsheet, conj_formula, ch)
+        # Call LLM and persist raw response alongside parsed JSON
+        # Ensure reasoning context is present on chosen client
+        client.set_reasoning_context(goal_text, rules_text)
+        text = ""
+        try:
+            text = client._chat(prompt)
+        except Exception as e:
+            if use_small:
+                if args.progress:
+                    print(f"[LLM] small-batch model failed: {e}. Falling back to primary model {llm.model}.")
+                try:
+                    client = llm
+                    client.set_reasoning_context(goal_text, rules_text)
+                    text = client._chat(prompt)
+                except Exception as e2:
+                    if args.progress:
+                        print(f"[LLM] primary model also failed: {e2}. Using zero scores for this chunk.")
+                    text = ""
+            else:
+                if args.progress:
+                    print(f"[LLM] model failed: {e}. Using zero scores for this chunk.")
+                text = ""
+        with open(os.path.join(chunk_dir, f"response_{idx:03d}.txt"), "w", encoding="utf-8") as rf:
+            rf.write(text)
+        res = extract_json(text)
+        if not res or "scores" not in res:
+            ids = [c["id"] for c in ch]
+            res = {"scores": [{"id": i, "score": 0.0} for i in ids]}
+        # annotate chunk with model used
+        try:
+            res_meta = res.setdefault("meta", {})
+            res_meta["model"] = getattr(client, "model", args.model)
+        except Exception:
+            pass
         if args.progress:
             print(f"[LLM]   -> received {len(res.get('scores', []))} scores.")
         save_json(res, os.path.join(chunk_dir, f"chunk_{idx:03d}.json"))
@@ -691,7 +809,23 @@ def main():
     # pack result with secondary tie-breaking
     ranking_items = [(int(cid), float(sc)) for cid, sc in final_scores.items()]
     ranking_items.sort(key=lambda kv: _tiebreak_tuple(kv[0], kv[1]))
-    ranking = ranking_items
+
+    # If scores are degenerate (all equal or near-equal), spread them by rank to avoid all zeros reaching iProver.
+    def _spread_if_degenerate(items):
+        if not items:
+            return items, False
+        vals = [v for _, v in items]
+        if (max(vals) - min(vals)) < 1e-9:
+            n = len(items)
+            if n == 1:
+                return [(items[0][0], 1.0)], True
+            # Map ranks to [1.0 .. 0.0]
+            mapped = [(cid, (n - i - 1) / (n - 1)) for i, (cid, _) in enumerate(items)]
+            return mapped, True
+        return items, False
+
+    ranking, used_spread_fallback = _spread_if_degenerate(ranking_items)
+    models_used = sorted({js.get("meta", {}).get("model", args.model) for js in chunk_results})
     result = {
         "meta": {
             "model": args.model,
@@ -707,6 +841,9 @@ def main():
                 "candidates": len(cands),
                 "anchors": len(anchor_ids),
                 "chunks": len(chunks),
+                "requested_anchors": requested_A,
+                "used_spread_fallback": used_spread_fallback,
+                "models_used": models_used,
             },
         },
         "conjecture_id": conj.get("id"),

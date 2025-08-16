@@ -1165,6 +1165,55 @@ class _EAState:
         self.last_sat_eval: Dict[int, List[bool]] = {}
         # Last SAT solver exec result ("sat"/"unsat"), if requested
         self.last_sat_result: Optional[str] = None
+        # Cache: (req_ids tuple, component, component_id, sat_hash) -> scores list
+        self.scores_cache: Dict[tuple, List[float]] = {}
+        # Throttle counter for SAT query rounds
+        self.sat_round: int = 0
+
+
+def _ea_make_cache_key(req_ids: List[int], component, component_id, sat_map: Optional[Dict[int, List[bool]]]) -> tuple:
+    """Build a stable cache key from req_ids, component identifiers, and SAT snapshot."""
+    import hashlib, json
+    if sat_map:
+        norm = {int(k): list(map(bool, v or [])) for k, v in sat_map.items()}
+        sat_hash = hashlib.sha1(json.dumps(norm, sort_keys=True).encode("utf-8")).hexdigest()
+    else:
+        sat_hash = "nosat"
+    return (tuple(req_ids), component, component_id, sat_hash)
+
+
+def _ea_fallback_scores_heuristic(req_ids: List[int], state: _EAState) -> Dict[int, float]:
+    """Heuristic non-zero fallback to keep iProver moving when the ranker fails."""
+    vals: Dict[int, float] = {}
+    for cid in req_ids:
+        info = state.clauses.get(int(cid), {})
+        formula = info.get("formula", "") or ""
+        f = info.get("features", {}) or {}
+        s = 0.0
+        cd = f.get("conj_dist", -1)
+        if isinstance(cd, int) and cd >= 0:
+            s += 2.0 / (1.0 + cd)
+        else:
+            s += 0.2
+        if '|' not in formula:
+            s += 0.5
+        if '=' in formula:
+            s += 0.3
+        if f.get("horn", False):
+            s += 0.2
+        sat_vals = state.last_sat_eval.get(int(cid), [])
+        if sat_vals:
+            support = sum(1 for v in sat_vals if v) / max(1, len(sat_vals))
+            pressure = 1.0 - support
+            s += 0.3 * float(pressure)
+        vals[int(cid)] = s
+    if not vals:
+        return {}
+    vs = list(vals.values())
+    vmin, vmax = min(vs), max(vs)
+    if vmax - vmin < 1e-9:
+        return {int(cid): 0.5 for cid in req_ids}
+    return {int(cid): (vals[int(cid)] - vmin) / (vmax - vmin) for cid in req_ids}
 
 
 def _ea_iter_json_messages(conn):
@@ -1220,8 +1269,10 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
                           chunk_size: int, anchors: int,
                           context_summary_k: int, summary_max_tokens: int,
                           dry_run: bool, progress: bool, verbose: bool,
-                          save_prompts: bool, artifacts_dir: Optional[str]) -> Dict[int, float]:
+                          save_prompts: bool, artifacts_dir: Optional[str],
+                          python_exec: Optional[str] = None) -> Dict[int, float]:
     import json, tempfile, subprocess, sys, os, time, hashlib
+    exe = python_exec or sys.executable
 
     def _mk_req_dir(base: str) -> str:
         ts = int(time.time() * 1000)
@@ -1238,7 +1289,7 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
         with open(in_path, 'w', encoding='utf-8') as f:
             json.dump(batch, f, ensure_ascii=False)
         cmd = [
-            sys.executable, ranker_script,
+            exe, ranker_script,
             '--input', in_path,
             '--out', out_path,
             '--chunk-size', str(chunk_size),
@@ -1256,6 +1307,8 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
         if save_prompts:
             cmd.append('--save-prompts')
         # 在 req_dir 下运行，确保 prompts/chunks 也写到该目录
+        if verbose:
+            print(f"[EA] ranker python: {exe}")
         subprocess.run(cmd, check=True, cwd=req_dir)
         data = json.load(open(out_path, 'r', encoding='utf-8'))
         print(f"[EA] artifacts saved under: {req_dir}")
@@ -1267,7 +1320,7 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
             with open(in_path, 'w', encoding='utf-8') as f:
                 json.dump(batch, f, ensure_ascii=False)
             cmd = [
-                sys.executable, ranker_script,
+                exe, ranker_script,
                 '--input', in_path,
                 '--out', out_path,
                 '--chunk-size', str(chunk_size),
@@ -1284,6 +1337,8 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
                 cmd.append('--verbose')
             if save_prompts:
                 cmd.append('--save-prompts')
+            if verbose:
+                print(f"[EA] ranker python: {exe}")
             subprocess.run(cmd, check=True)
             data = json.load(open(out_path, 'r', encoding='utf-8'))
             return {int(e['id']): float(e['score']) for e in data.get('scores', [])}
@@ -1291,6 +1346,29 @@ def _ea_score_with_ranker(batch: Dict, ranker_script: str, model: str,
 def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=None) -> Dict[str, Any]:
     req_ids = [int(i) for i in msg.get("clause_ids", [])]
     component = msg.get("component")
+    component_id = msg.get("component_id")
+    # Cache lookup (consider SAT snapshot when enabled)
+    sat_for_cache = state.last_sat_eval if getattr(args, 'include_sat_eval', False) else None
+    cache_key = _ea_make_cache_key(req_ids, component, component_id, sat_for_cache)
+    if cache_key in state.scores_cache:
+        scores_list = list(state.scores_cache[cache_key])
+        res: Dict[str, Any] = {"tag": "scores_res", "scores": scores_list}
+        if component is not None:
+            res["component"] = component
+        if component_id is not None:
+            res["component_id"] = component_id
+        if getattr(args, 'echo_clause_ids', False):
+            res["clause_ids"] = req_ids
+        if log_fp is not None:
+            delim = getattr(args, '_ea_log_delim', "\x00")
+            log_fp.write(json.dumps(msg, ensure_ascii=False) + delim)
+            log_fp.write(json.dumps(res, ensure_ascii=False) + delim)
+            log_fp.flush()
+        try:
+            print(f"[EA] cache hit for {len(req_ids)} clauses (component={component}/{component_id}).")
+        except Exception:
+            pass
+        return res
     batch = make_batch_for_scores_req(
         all_clauses=state.clauses,
         req_ids=req_ids,
@@ -1307,44 +1385,124 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
         }
     if getattr(state, 'last_sat_result', None) is not None:
         batch.setdefault('ea_query_features', {})['sat_solver_exec_result'] = state.last_sat_result
-    scores_map = _ea_score_with_ranker(
-        batch=batch,
-        ranker_script=args.ranker_script,
-        model=args.model,
-        chunk_size=args.chunk_size,
-        anchors=args.anchors,
-        context_summary_k=args.context_summary_k,
-        summary_max_tokens=args.summary_max_tokens,
-        dry_run=args.dry_run,
-        progress=args.progress,
-        verbose=args.verbose,
-        save_prompts=args.save_prompts,
-        artifacts_dir=args.artifacts_dir,
-    )
+    try:
+        scores_map = _ea_score_with_ranker(
+            batch=batch,
+            ranker_script=args.ranker_script,
+            model=args.model,
+            chunk_size=args.chunk_size,
+            anchors=args.anchors,
+            context_summary_k=args.context_summary_k,
+            summary_max_tokens=args.summary_max_tokens,
+            dry_run=args.dry_run,
+            progress=args.progress,
+            verbose=args.verbose,
+            save_prompts=args.save_prompts,
+            artifacts_dir=args.artifacts_dir,
+            python_exec=getattr(args, 'python_exec', None),
+        )
+    except Exception as e:
+        # Robust fallback: keep iProver running even if the ranker fails
+        try:
+            print(f"[EA] ranker failed: {e}. Using heuristic fallback for {len(req_ids)} clauses.")
+        except Exception:
+            pass
+        scores_map = _ea_fallback_scores_heuristic(req_ids, state)
     scores_list = [scores_map.get(cid, 0.0) for cid in req_ids]
-    res = {"tag": "scores_res", "scores": scores_list}
+    # Save to cache
+    state.scores_cache[cache_key] = list(map(float, scores_list))
+    # Include component identifiers for robustness across iProver builds
+    res: Dict[str, Any] = {"tag": "scores_res", "scores": scores_list}
+    if component is not None:
+        res["component"] = component
+    if component_id is not None:
+        res["component_id"] = component_id
+    # Optionally echo clause_ids to make mapping explicit (some agents rely on this)
+    if getattr(args, 'echo_clause_ids', False):
+        res["clause_ids"] = req_ids
     if log_fp is not None:
-        log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
-        log_fp.write(json.dumps(res, ensure_ascii=False) + "\x00")
+        delim = getattr(args, '_ea_log_delim', "\x00")
+        log_fp.write(json.dumps(msg, ensure_ascii=False) + delim)
+        log_fp.write(json.dumps(res, ensure_ascii=False) + delim)
         log_fp.flush()
     return res
 
 
 def run_ea_server(host: str, port: int, args) -> None:
-    import socket, threading, json
+    import socket, threading, json, sys, os, time
     state = _EAState()
-    log_fp = open(args.log_file, "a", encoding="utf-8") if getattr(args, 'log_file', None) else None
+    # Hard-code unified logs root and derive a per-run directory
+    LOGS_ROOT = "/home/ks/LLM/Logs"
+    run_dir = os.path.join(LOGS_ROOT, f"EA.{port}.{int(time.time())}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Override args.log_file and args.artifacts_dir to land under run_dir
+    args.log_file = os.path.join(run_dir, "EA.raw.jsonl.nul")
+    args.artifacts_dir = os.path.join(run_dir, "requests")
+    os.makedirs(args.artifacts_dir, exist_ok=True)
+
+    # Tee stdout to a file capturing console output (use sys.__stdout__ to avoid recursion)
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                try:
+                    s.write(data)
+                    s.flush()
+                except Exception:
+                    pass
+            return len(data)
+        def flush(self):
+            for s in self._streams:
+                try:
+                    s.flush()
+                except Exception:
+                    pass
+
+    try:
+        stdout_log_path = os.path.join(run_dir, "EA.stdout.log")
+        _stdout_f = open(stdout_log_path, "a", encoding="utf-8")
+        base_stream = getattr(sys, "__stdout__", None) or sys.stdout
+        sys.stdout = _Tee(base_stream, _stdout_f)
+    except Exception:
+        _stdout_f = None
+
+    # Open raw JSON log (NUL-delimited)
+    try:
+        log_fp = open(args.log_file, "a", encoding="utf-8")
+    except Exception:
+        log_fp = None
+    # Message delimiter configuration
+    # iProver writes JSON followed by "\n\x00\n" and reads incoming JSON line-by-line.
+    # If we only send a NUL without a trailing newline, iProver will block waiting for a line end.
+    # Therefore, when 'nul' is selected, we send the exact iProver delimiter "\n\x00\n";
+    # otherwise we send a plain newline-only framing.
+    msg_delim = "\n\x00\n" if getattr(args, 'delimiter', 'nul') == 'nul' else "\n"
+    # stash for logging helper
+    setattr(args, '_ea_log_delim', msg_delim)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
     sock.listen(1)
-    print(f"[EA] listening on {host}:{port}")
+    # Make accept interruptible so we can exit promptly after finish
+    sock.settimeout(1.0)
+    print(f"[EA] logs dir: {run_dir}")
+    print(f"[EA] listening on {host}:{port} (delimiter={'NUL+NEWLINE' if msg_delim=='\n\x00\n' else 'NEWLINE'})")
+
+    shutdown_event = threading.Event()
+    # Throttle frequency for SAT ground-literal evaluation (every N rounds)
+    SAT_EVAL_EVERY = 3
 
     def handle(conn, addr):
         with conn:
             print(f"[EA] connected from {addr}")
             for msg in _ea_iter_json_messages(conn):
                 tag = msg.get("tag")
+                try:
+                    print(f"[EA IN] {json.dumps(msg, ensure_ascii=False)}", flush=True)
+                except Exception:
+                    pass
                 if tag == "register_clauses":
                     _ea_handle_register_clauses(state, msg, log_fp)
                 elif tag == "scores_req":
@@ -1359,28 +1517,93 @@ def run_ea_server(host: str, port: int, args) -> None:
                             "component_id": msg.get("component_id"),
                         }
                         if log_fp is not None:
-                            log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
                             log_fp.flush()
                     else:
-                        res = _ea_handle_scores_req(state, msg, args, log_fp)
-                        conn.sendall((json.dumps(res) + "\x00").encode("utf-8"))
+                        # Store the scores request for processing after server_queries_start/end
+                        state.pending_scores = {
+                            "req_ids": [int(i) for i in msg.get("clause_ids", [])],
+                            "component": msg.get("component"),
+                            "component_id": msg.get("component_id"),
+                            "msg": msg
+                        }
+                        if log_fp is not None:
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
+                            log_fp.flush()
                 elif tag == "server_queries_start":
                     if getattr(args, 'use_server_queries', False) and state.pending_scores:
-                        # Ask iProver to evaluate the current candidates against its SAT model
-                        q = {"tag": "cls_sat_eval_gr_req", "clause_ids": state.pending_scores["req_ids"]}
-                        if log_fp is not None:
-                            log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
-                            log_fp.write(json.dumps(q, ensure_ascii=False) + "\x00")
-                            log_fp.flush()
-                        conn.sendall((json.dumps(q) + "\x00").encode("utf-8"))
-                        # We will send server_queries_end and scores_res once we receive the corresponding *_res
+                        state.sat_round += 1
+                        do_sat = (state.sat_round % SAT_EVAL_EVERY == 0)
+                        if do_sat:
+                            # Ask iProver to evaluate the current candidates against its SAT model
+                            q = {"tag": "cls_sat_eval_gr_req", "clause_ids": state.pending_scores["req_ids"]}
+                            if log_fp is not None:
+                                log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
+                                log_fp.write(json.dumps(q, ensure_ascii=False) + msg_delim)
+                                log_fp.flush()
+                            try:
+                                print(f"[EA OUT] {json.dumps(q, ensure_ascii=False)}", flush=True)
+                            except Exception:
+                                pass
+                            conn.sendall((json.dumps(q) + msg_delim).encode("utf-8"))
+                            # Will send server_queries_end after *_res
+                        else:
+                            # Throttled: end query window immediately and proceed to scoring
+                            end = {"tag": "server_queries_end"}
+                            if log_fp is not None:
+                                log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
+                                log_fp.write(json.dumps(end, ensure_ascii=False) + msg_delim)
+                                log_fp.flush()
+                            try:
+                                print(f"[EA OUT] {json.dumps(end, ensure_ascii=False)}", flush=True)
+                            except Exception:
+                                pass
+                            conn.sendall((json.dumps(end) + msg_delim).encode("utf-8"))
+                            # Process pending scores right away
+                            if state.pending_scores:
+                                pend = state.pending_scores
+                                msg2 = pend.get("msg") or {
+                                    "tag": "scores_req",
+                                    "clause_ids": pend["req_ids"],
+                                    "component": pend.get("component"),
+                                    "component_id": pend.get("component_id"),
+                                }
+                                res = _ea_handle_scores_req(state, msg2, args, log_fp)
+                                try:
+                                    print(f"[EA OUT] {json.dumps(res, ensure_ascii=False)}", flush=True)
+                                except Exception:
+                                    pass
+                                conn.sendall((json.dumps(res) + msg_delim).encode("utf-8"))
+                                state.pending_scores = None
                     else:
+                        # No server queries needed, send end immediately and then process scores
                         end = {"tag": "server_queries_end"}
                         if log_fp is not None:
-                            log_fp.write(json.dumps(msg, ensure_ascii=False) + "\x00")
-                            log_fp.write(json.dumps(end, ensure_ascii=False) + "\x00")
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
+                            log_fp.write(json.dumps(end, ensure_ascii=False) + msg_delim)
                             log_fp.flush()
-                        conn.sendall((json.dumps(end) + "\x00").encode("utf-8"))
+                        try:
+                            print(f"[EA OUT] {json.dumps(end, ensure_ascii=False)}", flush=True)
+                        except Exception:
+                            pass
+                        conn.sendall((json.dumps(end) + msg_delim).encode("utf-8"))
+
+                        # Now process the pending scores request
+                        if state.pending_scores:
+                            pend = state.pending_scores
+                            msg2 = pend.get("msg") or {
+                                "tag": "scores_req",
+                                "clause_ids": pend["req_ids"],
+                                "component": pend.get("component"),
+                                "component_id": pend.get("component_id"),
+                            }
+                            res = _ea_handle_scores_req(state, msg2, args, log_fp)
+                            try:
+                                print(f"[EA OUT] {json.dumps(res, ensure_ascii=False)}", flush=True)
+                            except Exception:
+                                pass
+                            conn.sendall((json.dumps(res) + msg_delim).encode("utf-8"))
+                            state.pending_scores = None
                 elif tag == "cls_sat_eval_gr_res":
                     # Some older builds use a typo 'cause_ids' — fall back if needed
                     ids = msg.get("clause_ids") or msg.get("cause_ids") or []
@@ -1393,9 +1616,13 @@ def run_ea_server(host: str, port: int, args) -> None:
                     # Finish the query window
                     end = {"tag": "server_queries_end"}
                     if log_fp is not None:
-                        log_fp.write(json.dumps(end, ensure_ascii=False) + "\x00")
+                        log_fp.write(json.dumps(end, ensure_ascii=False) + msg_delim)
                         log_fp.flush()
-                    conn.sendall((json.dumps(end) + "\x00").encode("utf-8"))
+                    try:
+                        print(f"[EA OUT] {json.dumps(end, ensure_ascii=False)}", flush=True)
+                    except Exception:
+                        pass
+                    conn.sendall((json.dumps(end) + msg_delim).encode("utf-8"))
                     # Now score and respond to the earlier scores_req
                     if state.pending_scores:
                         pend = state.pending_scores
@@ -1407,13 +1634,68 @@ def run_ea_server(host: str, port: int, args) -> None:
                             "component_id": pend.get("component_id"),
                         }
                         res = _ea_handle_scores_req(state, msg2, args, log_fp)
-                        conn.sendall((json.dumps(res) + "\x00").encode("utf-8"))
+                        try:
+                            print(f"[EA OUT] {json.dumps(res, ensure_ascii=False)}", flush=True)
+                        except Exception:
+                            pass
+                        conn.sendall((json.dumps(res) + msg_delim).encode("utf-8"))
                         state.pending_scores = None
+                # Detect finish/timeout from iProver and request shutdown
+                elif tag in ("szs_result_out", "szs_status_out", "proof_out"):
+                    # Many builds emit szs_result_out with a 'status' field; proof_out usually follows Unsatisfiable
+                    status = msg.get("status") or msg.get("szs_status") or msg.get("result")
+                    try:
+                        print(f"[EA] finish signal received (tag={tag}, status={status}), exiting", flush=True)
+                    except Exception:
+                        pass
+                    if log_fp is not None:
+                        log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
+                        log_fp.flush()
+                    if getattr(args, 'exit_on_finish', True):
+                        shutdown_event.set()
+                        break
                 # passive_clauses / given_clause / simplified_clauses 等可选消息，此处无需回包
+                else:
+                    # Still append to log file for completeness
+                    if log_fp is not None:
+                        try:
+                            log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
+                            log_fp.flush()
+                        except Exception:
+                            pass
+            # Connection ended; if configured, exit as well
+            if getattr(args, 'exit_on_finish', True) and not shutdown_event.is_set():
+                try:
+                    print("[EA] connection closed by iProver; exiting", flush=True)
+                except Exception:
+                    pass
+                shutdown_event.set()
 
     while True:
-        conn, addr = sock.accept()
+        if shutdown_event.is_set():
+            break
+        try:
+            conn, addr = sock.accept()
+        except socket.timeout:
+            continue
         threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+
+    # Cleanup and exit
+    try:
+        sock.close()
+    except Exception:
+        pass
+    if log_fp is not None:
+        try:
+            log_fp.close()
+        except Exception:
+            pass
+    if _stdout_f is not None:
+        try:
+            _stdout_f.close()
+        except Exception:
+            pass
+    sys.exit(0)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -1434,10 +1716,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_srv.add_argument('--host', type=str, default='127.0.0.1')
     p_srv.add_argument('--port', type=int, default=12345)
     p_srv.add_argument('--ranker-script', type=str, default='/Users/songkunwei/Desktop/LLM/batch_ranker.py', help='Path to batch_ranker.py')
+    p_srv.add_argument('--python-exec', dest='python_exec', type=str, default=None,
+                       help='Python interpreter to run the ranker (default: same as EA sys.executable)')
     p_srv.add_argument('--model', type=str, default='gpt-5', help='LLM model for ranking (passed to ranker)')
     p_srv.add_argument('--chunk-size', type=int, default=64)
     p_srv.add_argument('--artifacts-dir', type=str, default=None,
-                   help='If set, persist each scores_req artifacts (input batch, prompts if --save-prompts, out_scores.json) under this directory')
+                   help='If set, persist each scores_req artifacts for BOTH EA and ranker under this directory. \n'
+                        'EA: raw I/O (if --log-file), per-request batch JSON. Ranker: summary prompt/response, chunk prompts and raw responses, out_scores.json.')
     p_srv.add_argument('--anchors', type=int, default=8)
     p_srv.add_argument('--context-summary-k', type=int, default=64)
     p_srv.add_argument('--summary-max-tokens', type=int, default=500)
@@ -1449,8 +1734,17 @@ def main(argv: Optional[List[str]] = None) -> None:
                        help='Between scores_req and scores_res, request cls_sat_eval_gr from iProver and feed results into the ranker')
     p_srv.add_argument('--include-sat-eval', dest='include_sat_eval', action='store_true',
                        help='Include cls_sat_eval_gr results in batch JSON as ea_query_features.sat_lit_gr_vals')
+    p_srv.add_argument('--delimiter', type=str, choices=['nul','newline'], default='nul',
+                       help='Message delimiter when sending to iProver (default NUL). Use newline for older/debug tools that dislike NUL.')
+    p_srv.add_argument('--echo-clause-ids', dest='echo_clause_ids', action='store_true',
+                       help='Include clause_ids in scores_res for explicit mapping.')
     p_srv.add_argument('--context-size', type=int, default=128, help='Context size used when building each batch for a scores_req')
     p_srv.add_argument('--log-file', type=str, default=None, help='Append raw request/response JSON (NUL-separated) to this file')
+    # Auto-exit on finish/timeout from iProver (default: enabled)
+    p_srv.add_argument('--exit-on-finish', dest='exit_on_finish', action='store_true', default=True,
+                       help='Exit EA automatically when iProver sends final status (e.g., szs_result_out/proof_out) or closes the connection')
+    p_srv.add_argument('--no-exit-on-finish', dest='exit_on_finish', action='store_false',
+                       help='Do not exit EA automatically when iProver finishes')
 
     args = parser.parse_args(argv)
 
