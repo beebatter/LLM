@@ -206,6 +206,28 @@ def format_goal_frontier_text(goal: Dict[str, Any]) -> str:
         lines.append("= goals: EQ/2 (equality present)")
     return "\n".join(lines) or "(empty)"
 
+
+def format_conjecture_targets_text(targets: Dict[str, Any]) -> str:
+    """
+    Pretty-print conjecture target functors/constants (produced by process_iprover_v2.py).
+    targets example:
+      {"functors": ["F1/3"], "first_arg_consts": ["C1"], "goal_consts": ["C2","C3","C4","C5"]}
+    """
+    if not isinstance(targets, dict):
+        return ""
+    parts = []
+    funs = targets.get("functors") or []
+    firsts = targets.get("first_arg_consts") or []
+    gconsts = targets.get("goal_consts") or []
+    if funs:
+        parts.append("target functors: " + ", ".join(funs))
+    if firsts:
+        parts.append("first-arg consts: " + ", ".join(firsts))
+    if gconsts:
+        parts.append("goal consts: " + ", ".join(gconsts))
+    return "\n".join(parts)
+
+
 def build_reasoning_rules_text() -> str:
     return (
         "Resolution: if ~P(t) is in clause C and P(s) is in a goal clause and t unifies s, resolve to eliminate P.\n"
@@ -324,33 +346,21 @@ def _find_run_root(out_dir: str) -> str:
 def _prompt_fingerprint(prompt_text: str) -> str:
     return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
-def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
-    ctx_text = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in ctx_list[:80])
-    return f"""
-    你是自动定理证明（ATP）助手。请基于“命名不变”的公式写一段**精炼的背景摘要**（<= {max_tokens} tokens）：
-    - 使用下面的“符号速查表”理解 P#/F#/C# 的原名语义；
-    - 保持命名不变，不替换 P#/F#/C#；
-    - 摘要重点：与猜想直接相关的关系/构造、常见模式、明显的蕴含或等价线索、易混淆的符号区别；
-    - 覆盖**等式类与非等式类**两种模式，并考虑**不同谓词元数**之间可组合的推理链；
-    - 列出 6–10 条要点；避免复述每条子句；不要输出任何评分。
-
-    【猜想】:
-    {conjecture_formula}
-
-    【符号速查表】:
-    {cheatsheet}
-
-    【上下文(节选)】:
-    {ctx_text}
-
-    只输出摘要正文，不要额外说明。
-    """.strip()
-
 def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str) -> str:
+    def _merge_tags(c: Dict[str, Any]) -> List[str]:
+        # Merge EA tags (from process_iprover_v2.py) with local semantic tags
+        ea_tags = c.get("tags", []) or []
+        sem_tags = c.get("_sem_tags", []) or []
+        merged = []
+        for t in (ea_tags + sem_tags):
+            if t not in merged:
+                merged.append(t)
+        return merged
+
     def _line(c: Dict[str, Any]) -> str:
-        tags = c.get("_sem_tags", [])
-        tag_str = ", ".join(tags) if tags else ""
+        tag_str = ", ".join(_merge_tags(c))
         return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
+
     lines = "\n".join(_line(c) for c in chunk)
     example = """
 {
@@ -369,12 +379,14 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
   C: 15–29 结构可用但当前缺桥（投影/置换/读参模板未与 F1 接通）
   D: 0–14 与目标无关或仅变元自等
 - 优先级：一跳解析/重写 > 注入/观测 > 其他 Horn；禁止使用频度/重合度/长度为理由。
-- 触碰目标符号：凡候选直接出现 F1/3 或一跳改写到 F1/3，显著加分（A 组）。
-- 输出 JSON，仅含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
+- **使用 tags（强信号）**：
+  - `eq_of_target_functor` ⇒ A 档强加分；
+  - `touches_target_functor` 且 `first_arg_in_goal` ⇒ B 档；
+  - `shares_goal_consts:k` 仅微调（k 越大越高），`horn`/`unit` 仅用于并列打破；
+  - `sat_support=..`/`sat_pressure=..` 只作轻微微调。
+- 只输出 JSON，每条包含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
 
-- 只输出 JSON，不要额外文字。每条包含 id、score、why（极短理由，≤12字）。
-
-【目标前沿（抽象）】
+【目标前沿（抽象+目标模式）】
 {goal_text}
 
 【推理规则（参考）】
@@ -518,7 +530,7 @@ def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     if isinstance(data, list) and data and all(isinstance(x, dict) and "id" in x and "score" in x for x in data):
         for x in data:
             try:
-                out.append({"id": int(x["id"]), "score": float(x["score"])})
+                out.append({"id": int(x["id"]), "score": float(x["score"]), **({"why": x.get("why")} if "why" in x else {})})
             except Exception:
                 pass
         if out:
@@ -531,9 +543,13 @@ def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 cid = int(k)
                 if isinstance(v, dict) and "score" in v:
                     sc = float(v.get("score", 0.0))
+                    rec = {"id": cid, "score": sc}
+                    if "why" in v:
+                        rec["why"] = v["why"]
+                    out.append(rec)
                 else:
                     sc = float(v)
-                out.append({"id": cid, "score": sc})
+                    out.append({"id": cid, "score": sc})
             except Exception:
                 continue
         if out:
@@ -616,10 +632,20 @@ def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: Lis
     """.strip()
 
 def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str) -> str:
+    def _merge_tags(c: Dict[str, Any]) -> List[str]:
+        # Merge EA tags (from process_iprover_v2.py) with local semantic tags
+        ea_tags = c.get("tags", []) or []
+        sem_tags = c.get("_sem_tags", []) or []
+        merged = []
+        for t in (ea_tags + sem_tags):
+            if t not in merged:
+                merged.append(t)
+        return merged
+
     def _line(c: Dict[str, Any]) -> str:
-        tags = c.get("_sem_tags", [])
-        tag_str = ", ".join(tags) if tags else ""
+        tag_str = ", ".join(_merge_tags(c))
         return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
+
     lines = "\n".join(_line(c) for c in chunk)
     example = """
 {
@@ -638,10 +664,14 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
   C: 15–29 结构可用但当前缺桥（投影/置换/读参模板未与 F1 接通）
   D: 0–14 与目标无关或仅变元自等
 - 优先级：一跳解析/重写 > 注入/观测 > 其他 Horn；禁止使用频度/重合度/长度为理由。
-- 触碰目标符号：凡候选直接出现 F1/3 或一跳改写到 F1/3，显著加分（A 组）。
-- 输出 JSON，仅含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
+- **使用 tags（强信号）**：
+  - `eq_of_target_functor` ⇒ A 档强加分；
+  - `touches_target_functor` 且 `first_arg_in_goal` ⇒ B 档；
+  - `shares_goal_consts:k` 仅微调（k 越大越高），`horn`/`unit` 仅用于并列打破；
+  - `sat_support=..`/`sat_pressure=..` 只作轻微微调。
+- 只输出 JSON，每条包含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
 
-【目标前沿（抽象）】
+【目标前沿（抽象+目标模式）】
 {goal_text}
 
 【推理规则（参考）】
@@ -805,6 +835,7 @@ def main():
     conj = ds.get("conjecture")
     ctx = ds.get("context_clauses", [])
     cands = ds.get("candidate_clauses", [])
+    conj_targets: Dict[str, Any] = ds.get("conjecture_targets", {}) or {}
     eqf: Dict[str, Any] = ds.get("ea_query_features", {}) or {}
     sat_map: Dict[str, Any] = eqf.get("sat_lit_gr_vals", {}) or {}
 
@@ -893,6 +924,8 @@ def main():
     conj_formula = conj.get("canonical_formula", "")
     goal = extract_goal_frontier(conj_formula)
     goal_text = format_goal_frontier_text(goal)
+    targets_text = format_conjecture_targets_text(conj_targets)
+    goal_text_with_targets = goal_text + (("\n" + targets_text) if targets_text else "")
     rules_text = build_reasoning_rules_text()
 
     # attach SAT metrics (if any) and compute semantic tags
@@ -900,7 +933,7 @@ def main():
     compute_and_attach_sem_tags(cands, goal)
 
     # Provide reasoning context to the client
-    llm.set_reasoning_context(goal_text, rules_text)
+    llm.set_reasoning_context(goal_text_with_targets, rules_text)
 
     # anchors: 简化版不使用 anchors
     requested_A = 0
@@ -929,7 +962,7 @@ def main():
         if args.progress:
             mdl = getattr(client, "model", "?")
             print(f"[LLM] Scoring chunk {idx+1}/{len(chunks)} (size={len(ch)}) with model={mdl}...")
-        prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text, rules_text)
+        prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text_with_targets, rules_text)
         with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
             pf.write(prompt)
         client.set_reasoning_context(goal_text, rules_text)

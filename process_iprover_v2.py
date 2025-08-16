@@ -1054,12 +1054,37 @@ def build_canonical_dataset(
                         sym_kind = 'predicate'
                 canonicaliser.get_canonical_symbol(base_name, is_constant, arity, sym_kind)
             i = j
-    # Local helper to canonicalise a clause
+    # Build conjecture representation
+    conj_repr = None
+    if conjecture_entry is not None:
+        conj_id, conj_info = conjecture_entry
+        cformula, var_map, local_syms = canonicalise_formula(
+            conj_info['formula'], canonicaliser,
+            kind_func_terms=kind_funcs, pred_head_set=kind_preds
+        )
+        conj_repr = {
+            'id': conj_id,
+            'canonical_formula': cformula,
+            'original_formula': conj_info['formula'],
+            'features': conj_info['features'],
+            'variable_mapping': var_map,
+            'local_symbols': {canon: sorted(list(names)) for canon, names in local_syms.items()},
+        }
+        if include_ast:
+            conj_repr['canonical_formula_ast'] = parse_canonical_formula_ast(cformula)
+
+    # <<< 新增：从猜想中提取目标函数/常量集合 >>>
+    conj_targets = _extract_conjecture_targets(conj_repr)
+
+    # Local helper to canonicalise a clause + tags（闭包里用到 conj_targets）
     def canonicalise_clause(cid: int) -> Dict:
         entry = clauses[cid]
         formula = entry['formula']
-        cformula, var_map, local_syms = canonicalise_formula(formula, canonicaliser, kind_func_terms=kind_funcs, pred_head_set=kind_preds)
-        d = {
+        cformula, var_map, local_syms = canonicalise_formula(
+            formula, canonicaliser,
+            kind_func_terms=kind_funcs, pred_head_set=kind_preds
+        )
+        record = {
             'id': cid,
             'canonical_formula': cformula,
             'original_formula': formula,
@@ -1067,9 +1092,19 @@ def build_canonical_dataset(
             'variable_mapping': var_map,
             'local_symbols': {canon: sorted(list(names)) for canon, names in local_syms.items()},
         }
+        ast = None
         if include_ast:
-            d['canonical_formula_ast'] = parse_canonical_formula_ast(cformula)
-        return d
+            ast = parse_canonical_formula_ast(cformula)
+            record['canonical_formula_ast'] = ast
+        # <<< 新增：计算 reasoning tags >>>
+        tags, tag_info = _compute_reasoning_tags(cformula, ast, conj_targets)
+        record['tags'] = tags
+        record['tag_info'] = tag_info
+        # 兜底：若缺少 lit_count，可用顶层 "or" 拆分估算
+        if 'lit_count' not in record['features']:
+            lits = _kw_split_top_level_disj(cformula)
+            record['features']['lit_count'] = len(lits) if lits else 1
+        return record
     # Build conjecture representation
     conj_repr = None
     if conjecture_entry is not None:
@@ -1127,9 +1162,129 @@ def build_canonical_dataset(
         },
         'symbol_map': symbol_map,
         'conjecture': conj_repr,
+        'conjecture_targets': conj_targets,   # <<< 新增
         'context_clauses': context_clauses,
         'candidate_clauses': candidate_clauses,
     }
+
+# ====== Reasoning tags helpers (add below parse_canonical_formula_ast) ======
+import re
+
+def _collect_constants_from_canonical(formula: str) -> set[str]:
+    return set(re.findall(r"C\d+", formula))
+
+def _term_head_name(node):
+    """Return (head_name, arity) if node is a function term of form f(args), else None."""
+    if isinstance(node, dict) and "atom" in node and isinstance(node["atom"].get("args"), list):
+        return node["atom"]["pred"], len(node["atom"]["args"])
+    return None
+
+def _extract_conjecture_targets(conj_repr: Optional[dict]) -> dict:
+    """
+    From the conjecture canonical formula, extract:
+      - target functors (names/arity) appearing as heads on both sides of =/!=
+      - the first-argument constants of those functors (e.g., {C1})
+      - all constants used inside those functor arguments (goal const set)
+    """
+    targets = {"functors": set(), "first_arg_consts": set(), "goal_consts": set()}
+    if not conj_repr:
+        return {"functors": [], "first_arg_consts": [], "goal_consts": []}
+
+    ast = parse_canonical_formula_ast(conj_repr["canonical_formula"])
+    if isinstance(ast, dict) and ast.get("op") in ("=", "neq"):
+        for side in ast["args"]:
+            head = _term_head_name(side)
+            if head:
+                name, ar = head
+                targets["functors"].add((name, ar))
+                args = side["atom"]["args"]
+                if args:
+                    a0 = args[0]
+                    if isinstance(a0, str) and re.fullmatch(r"C\d+", a0):
+                        targets["first_arg_consts"].add(a0)
+                for a in args:
+                    if isinstance(a, str) and re.fullmatch(r"C\d+", a):
+                        targets["goal_consts"].add(a)
+
+    return {
+        "functors": [f"{n}/{k}" for (n,k) in sorted(targets["functors"])],
+        "first_arg_consts": sorted(targets["first_arg_consts"]),
+        "goal_consts": sorted(targets["goal_consts"]),
+    }
+
+def _compute_reasoning_tags(canonical_formula: str, ast, targets: dict) -> tuple[list[str], dict]:
+    """
+    Compute lightweight reasoning tags for one clause, given the conjecture targets.
+    Returns (tags_list, tag_info_dict).
+    """
+    tags=[]; info={}
+    tf_names = {t.split('/')[0] for t in targets.get("functors", [])}
+
+    # parse AST if caller didn't provide
+    if not ast:
+        ast = parse_canonical_formula_ast(canonical_formula)
+
+    # touches_target_functor: cheap check by string
+    touches = any((name + "(") in canonical_formula for name in tf_names)
+    if touches:
+        tags.append("touches_target_functor")
+
+    # eq_of_target_functor: both sides of =/!= are target head
+    is_eq = isinstance(ast, dict) and ast.get("op") in ("=", "neq")
+    if is_eq:
+        left, right = ast["args"]
+        def head_name(n):
+            h = _term_head_name(n)
+            return h[0] if h else None
+        if head_name(left) in tf_names and head_name(right) in tf_names:
+            tags.append("eq_of_target_functor")
+
+    # first_arg_in_goal: exists F*(C_goal,*,*)
+    first_consts = set(targets.get("first_arg_consts", []))
+    def has_first_arg_const(node) -> bool:
+        if isinstance(node, dict) and "atom" in node:
+            name = node["atom"]["pred"]
+            if name in tf_names and node["atom"]["args"]:
+                a0 = node["atom"]["args"][0]
+                return isinstance(a0, str) and a0 in first_consts
+        return False
+
+    def walk(n) -> bool:
+        if has_first_arg_const(n):
+            return True
+        if isinstance(n, dict):
+            if "atom" in n:
+                for a in n["atom"]["args"]:
+                    if walk(a): return True
+            # check generic substructures
+            for k in ("args","body"):
+                v = n.get(k)
+                if isinstance(v, list):
+                    for a in v:
+                        if walk(a): return True
+                elif isinstance(v, dict):
+                    if walk(v): return True
+        return False
+
+    if first_consts and walk(ast):
+        tags.append("first_arg_in_goal")
+
+    # shares_goal_consts:k
+    clause_consts = _collect_constants_from_canonical(canonical_formula)
+    goal_consts = set(targets.get("goal_consts", []))
+    shared = clause_consts & goal_consts
+    if shared:
+        tags.append(f"shares_goal_consts:{len(shared)}")
+
+    info = {
+        "touches_target_functor": bool(touches),
+        "eq_of_target_functor": ("eq_of_target_functor" in tags),
+        "first_arg_in_goal": ("first_arg_in_goal" in tags),
+        "shares_goal_consts_n": len(shared),
+        "constants_shared": sorted(shared),
+    }
+    return tags, info
+# ====== end helpers ======
 
 
 def make_batch_for_scores_req(
@@ -1152,7 +1307,7 @@ def make_batch_for_scores_req(
         candidate_size=len(req_ids),
         mapping_scope=mapping_scope,
         component=component,
-        include_ast=include_ast,
+        include_ast=True,  # <-- was False
     )
 
 # ---------------------- Minimal interactive EA server (optional) ----------------------
