@@ -346,9 +346,13 @@ def _find_run_root(out_dir: str) -> str:
 def _prompt_fingerprint(prompt_text: str) -> str:
     return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
-def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str) -> str:
+def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str, prompt_path: str = None) -> str:
+    """
+    构建评分prompt，支持从文件加载模板。
+    prompt_path: 指定prompt模板文件路径，默认为prompts/scoring_prompt.txt。
+    """
+    import pathlib
     def _merge_tags(c: Dict[str, Any]) -> List[str]:
-        # Merge EA tags (from process_iprover_v2.py) with local semantic tags
         ea_tags = c.get("tags", []) or []
         sem_tags = c.get("_sem_tags", []) or []
         merged = []
@@ -356,11 +360,9 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
             if t not in merged:
                 merged.append(t)
         return merged
-
     def _line(c: Dict[str, Any]) -> str:
         tag_str = ", ".join(_merge_tags(c))
         return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
-
     lines = "\n".join(_line(c) for c in chunk)
     example = """
 {
@@ -370,43 +372,21 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
   ]
 }
 """.strip()
-    return f"""
-你是 ATP 子句打分器。请仅基于推理可用性为每个候选打分，并输出紧凑 JSON。
-- 分值范围：0–50 的整数或小数；
-- 仅基于推理可用性打分（0–50）：
-  A: 45–50 直接触达 F1/3（含 F1 等式/不等式，或一跳可重写到目标式样）
-  B: 30–44 需一跳桥接到 F1（上下文/anchors 可见明确桥接）
-  C: 15–29 结构可用但当前缺桥（投影/置换/读参模板未与 F1 接通）
-  D: 0–14 与目标无关或仅变元自等
-- 优先级：一跳解析/重写 > 注入/观测 > 其他 Horn；禁止使用频度/重合度/长度为理由。
-- **使用 tags（强信号）**：
-  - `eq_of_target_functor` ⇒ A 档强加分；
-  - `touches_target_functor` 且 `first_arg_in_goal` ⇒ B 档；
-  - `shares_goal_consts:k` 仅微调（k 越大越高），`horn`/`unit` 仅用于并列打破；
-  - `sat_support=..`/`sat_pressure=..` 只作轻微微调。
-- 只输出 JSON，每条包含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
-
-【目标前沿（抽象+目标模式）】
-{goal_text}
-
-【推理规则（参考）】
-{rules_text}
-
-【背景摘要（全局共享）】
-{summary}
-
-【符号速查表（节选）】
-{cheatsheet}
-
-【猜想】
-{conjecture_formula}
-
-【待评分子句（每条含 tags + 公式）】
-{lines}
-
-【输出示例】
-{example}
-""".strip()
+    # 默认prompt路径
+    if prompt_path is None:
+        prompt_path = str(pathlib.Path(__file__).parent / "prompts/scoring_prompt.txt")
+    # 读取模板
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        template = f.read()
+    # 替换变量
+    prompt = template.replace("{{goal_text}}", goal_text)
+    prompt = prompt.replace("{{rules_text}}", rules_text)
+    prompt = prompt.replace("{{summary}}", summary)
+    prompt = prompt.replace("{{cheatsheet}}", cheatsheet)
+    prompt = prompt.replace("{{conjecture_formula}}", conjecture_formula)
+    prompt = prompt.replace("{{lines}}", lines)
+    prompt = prompt.replace("{{example}}", example)
+    return prompt
 
 # -------------------------- LLM -----------------------------
 
@@ -609,27 +589,22 @@ def _find_run_root(out_dir: str) -> str:
 def _prompt_fingerprint(prompt_text: str) -> str:
     return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
-def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
+def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int, prompt_path: str = None) -> str:
+    """
+    构建摘要prompt，支持从文件加载模板。
+    prompt_path: 指定prompt模板文件路径，默认为prompts/summary_prompt.txt。
+    """
+    import pathlib
     ctx_text = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in ctx_list[:80])
-    return f"""
-    你是自动定理证明（ATP）助手。请基于“命名不变”的公式写一段**精炼的背景摘要**（<= {max_tokens} tokens）：
-    - 使用下面的“符号速查表”理解 P#/F#/C# 的原名语义；
-    - 保持命名不变，不替换 P#/F#/C#；
-    - 摘要重点：与猜想直接相关的关系/构造、常见模式、明显的蕴含或等价线索、易混淆的符号区别；
-    - 覆盖**等式类与非等式类**两种模式，并考虑**不同谓词元数**之间可组合的推理链；
-    - 列出 6–10 条要点；避免复述每条子句；不要输出任何评分。
-
-    【猜想】:
-    {conjecture_formula}
-
-    【符号速查表】:
-    {cheatsheet}
-
-    【上下文(节选)】:
-    {ctx_text}
-
-    只输出摘要正文，不要额外说明。
-    """.strip()
+    if prompt_path is None:
+        prompt_path = str(pathlib.Path(__file__).parent / "prompts/summary_prompt.txt")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        template = f.read()
+    prompt = template.replace("{{max_tokens}}", str(max_tokens))
+    prompt = prompt.replace("{{conjecture_formula}}", conjecture_formula)
+    prompt = prompt.replace("{{cheatsheet}}", cheatsheet)
+    prompt = prompt.replace("{{ctx_text}}", ctx_text)
+    return prompt
 
 def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str) -> str:
     def _merge_tags(c: Dict[str, Any]) -> List[str]:
@@ -777,12 +752,12 @@ class LLMClient:
         self._goal_text = goal_text
         self._rules_text = rules_text
 
-    def summarize(self, conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
-        prompt = build_summary_prompt(conjecture_formula, cheatsheet, ctx_list, max_tokens)
+    def summarize(self, conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int, prompt_path: str = None) -> str:
+        prompt = build_summary_prompt(conjecture_formula, cheatsheet, ctx_list, max_tokens, prompt_path=prompt_path)
         return self._chat(prompt)
 
-    def score_chunk(self, summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]]) -> Dict[str, Any]:
-        prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk, self._goal_text, self._rules_text)
+    def score_chunk(self, summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], prompt_path: str = None) -> Dict[str, Any]:
+        prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk, self._goal_text, self._rules_text, prompt_path=prompt_path)
         text = self._chat(prompt)
         parsed = extract_json(text)
         coerced = coerce_scores(parsed, chunk)
