@@ -251,6 +251,201 @@ def extract_json(text: str) -> dict:
     return {}
 
 
+# ---------------------- Prompt Builders ---------------------
+
+def build_symbol_cheatsheet(symbol_map: Dict[str, Any], keys: List[str], max_items: int = 120) -> str:
+    rows = []
+    for k in sorted(keys)[:max_items]:
+        info = symbol_map.get(k)
+        if not info:
+            continue
+        orig = ", ".join(info.get("original", []))
+        rows.append(f"{k} ⇨ {orig}  ({info.get('kind')}, arity={info.get('arity')})")
+    return "\n".join(rows)
+
+def _find_run_root(out_dir: str) -> str:
+    """Best-effort detection of the EA run root directory.
+    We expect args.out like: .../EA.<port>.<ts>/requests/scores_req_xxx/out_scores.json
+    Return the parent of 'requests' if found; otherwise return out_dir.
+    """
+    cur = os.path.abspath(out_dir)
+    # Limit the climb depth to avoid walking to filesystem root indefinitely
+    for _ in range(5):
+        base = os.path.basename(cur)
+        if base == "requests":
+            return os.path.dirname(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return os.path.abspath(out_dir)
+
+def _prompt_fingerprint(prompt_text: str) -> str:
+    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+
+def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
+    ctx_text = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in ctx_list[:80])
+    return f"""
+    你是自动定理证明（ATP）助手。请基于“命名不变”的公式写一段**精炼的背景摘要**（<= {max_tokens} tokens）：
+    - 使用下面的“符号速查表”理解 P#/F#/C# 的原名语义；
+    - 保持命名不变，不替换 P#/F#/C#；
+    - 摘要重点：与猜想直接相关的关系/构造、常见模式、明显的蕴含或等价线索、易混淆的符号区别；
+    - 覆盖**等式类与非等式类**两种模式，并考虑**不同谓词元数**之间可组合的推理链；
+    - 列出 6–10 条要点；避免复述每条子句；不要输出任何评分。
+
+    【猜想】:
+    {conjecture_formula}
+
+    【符号速查表】:
+    {cheatsheet}
+
+    【上下文(节选)】:
+    {ctx_text}
+
+    只输出摘要正文，不要额外说明。
+    """.strip()
+
+def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str) -> str:
+    def _line(c: Dict[str, Any]) -> str:
+        tags = c.get("_sem_tags", [])
+        tag_str = ", ".join(tags) if tags else ""
+        return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
+    lines = "\n".join(_line(c) for c in chunk)
+    example = """
+{
+  "scores": [
+    {"id": 12345, "score": 42, "why": "unit resolvable"},
+    {"id": 23456, "score": 5,  "why": "no bridge"}
+  ]
+}
+""".strip()
+    return f"""
+你是 ATP 子句打分器。请仅基于推理可用性为每个候选打分，并输出紧凑 JSON。
+- 分值范围：0–50 的整数或小数；
+- 评分依据（精简版，仅参考）：
+  1) 与【目标前沿】的可解性（resolvable:*），是否能一跳解析/关闭；
+  2) 等式重写潜力（eq + 一跳 rewrite）；
+  3) Horn 可实例化潜力（horn）；
+  4) SAT 观测（sat_support / sat_pressure）仅作微调。
+- 只输出 JSON，不要额外文字。每条包含 id、score、why（极短理由，≤12字）。
+
+【目标前沿（抽象）】
+{goal_text}
+
+【推理规则（参考）】
+{rules_text}
+
+【背景摘要（全局共享）】
+{summary}
+
+【符号速查表（节选）】
+{cheatsheet}
+
+【猜想】
+{conjecture_formula}
+
+【待评分子句（每条含 tags + 公式）】
+{lines}
+
+【输出示例】
+{example}
+""".strip()
+
+# -------------------------- LLM -----------------------------
+
+class LLMClient:
+    def __init__(self, model: str = "gpt-5", temperature: float = 1.0, dry_run: bool = False, max_retries: int = 3, verbose: bool = False):
+        self.model = model
+        self.temperature = temperature
+        self.dry_run = dry_run
+        self.max_retries = max_retries
+        self.verbose = verbose
+        self._goal_text = ""
+        self._rules_text = ""
+        # Auto-fix temperature for models that require default=1
+        if ("gpt-5" in self.model) and (not self.dry_run) and (temperature != 1.0):
+            self.temperature = 1.0
+            if self.verbose:
+                print("[LLM] Model requires default temperature; overriding to 1.0")
+        self._client = None
+        if not dry_run:
+            try:
+                # New-style SDK
+                from openai import OpenAI  # type: ignore
+                self._client = OpenAI()
+            except Exception:
+                # Old-style SDK fallback
+                try:
+                    import openai  # type: ignore
+                    self._client = openai
+                except Exception:
+                    raise RuntimeError("OpenAI SDK not available. Install `openai` and set OPENAI_API_KEY.")
+
+    def _chat(self, prompt: str) -> str:
+        if self.dry_run:
+            text = prompt.strip()
+            # Detect scoring prompt more flexibly
+            if ("ATP 子句打分器" in text) or ("子句打分器" in text):
+                # Robustly extract IDs even if bullets/colons vary
+                ids = [int(m) for m in re.findall(r"ID\s+(\d+)", text)]
+                # produce 0..50 scores with tiny bias by id
+                payload = {
+                    "scores": [
+                        {"id": i, "score": int((i % 51)), "why": "mock"} for i in ids
+                    ]
+                }
+                return json.dumps(payload, ensure_ascii=False)
+            # Otherwise treat it as a summary prompt
+            return "(占位) 背景摘要：…"
+        last_err = None
+        for _ in range(self.max_retries):
+            if self.verbose:
+                print(f"[LLM] request try {_+1}/{self.max_retries}...")
+            try:
+                # New-style SDK path
+                if hasattr(self._client, "chat"):
+                    resp = self._client.chat.completions.create(
+                        model=self.model,
+                        temperature=self.temperature,
+                        messages=[
+                            {"role": "system", "content": "You are a careful assistant. Always follow the user instructions strictly."},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    return resp.choices[0].message.content or ""
+                # Old-style SDK path
+                if hasattr(self._client, "ChatCompletion"):
+                    resp = self._client.ChatCompletion.create(
+                        model=self.model,
+                        temperature=self.temperature,
+                        messages=[
+                            {"role": "system", "content": "You are a careful assistant. Always follow the user instructions strictly."},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    return resp["choices"][0]["message"]["content"]
+            except Exception as e:  # pragma: no cover
+                if self.verbose:
+                    print(f"[LLM] error: {e}. retrying...")
+                last_err = e
+                time.sleep(1.0)
+        raise RuntimeError(f"LLM request failed after retries: {last_err}")
+
+    def set_reasoning_context(self, goal_text: str, rules_text: str) -> None:
+        self._goal_text = goal_text
+        self._rules_text = rules_text
+
+    def summarize(self, conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
+        prompt = build_summary_prompt(conjecture_formula, cheatsheet, ctx_list, max_tokens)
+        return self._chat(prompt)
+
+    def score_chunk(self, summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]]) -> Dict[str, Any]:
+        prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk, self._goal_text, self._rules_text)
+        text = self._chat(prompt)
+        parsed = extract_json(text)
+        coerced = coerce_scores(parsed, chunk)
+        return {"scores": coerced}
+
 # ---------------- Score coercion and flat-spread helpers -----------------
 from typing import Any, Tuple
 
@@ -258,8 +453,8 @@ def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     """
     Normalize various model output shapes into a list of {id, score} dicts.
     Accepts:
-      - {"scores": [{"id":..,"score":..}, ...]}
-      - {"scores": {"123": 0.8, "124": 0.2, ...}}
+      - {"scores": [{"id":..,"score":..,("why":..)}, ...]}
+      - {"scores": {"123": 0.8, "124": {"score": 12, "why": "..."}, ...}}
       - {"123": 0.8, "124": 0.2, ...}   (top-level mapping)
       - [0.1, 0.2, ...]                 (aligned by order of IDs in `chunk`)
     Falls back to zeros if nothing usable is found.
@@ -274,7 +469,7 @@ def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     else:
         data = obj
 
-    # Case 1: list of {"id","score"} dicts
+    # Case 1: list of dicts
     if isinstance(data, list) and data and all(isinstance(x, dict) and "id" in x and "score" in x for x in data):
         for x in data:
             try:
@@ -284,12 +479,15 @@ def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if out:
             return out
 
-    # Case 2: dict mapping id -> score
+    # Case 2: dict mapping id -> score or id -> {"score":..., ...}
     if isinstance(data, dict):
         for k, v in data.items():
             try:
                 cid = int(k)
-                sc = float(v)
+                if isinstance(v, dict) and "score" in v:
+                    sc = float(v.get("score", 0.0))
+                else:
+                    sc = float(v)
                 out.append({"id": cid, "score": sc})
             except Exception:
                 continue
@@ -311,43 +509,9 @@ def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         return [{"id": int(cid), "score": 0.0} for cid in ids]
     return out
 
-
 def spread_if_chunk_flat(scores_arr: List[Dict[str, Any]], chunk: List[Dict[str, Any]], eps: float = 1e-9) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    If all scores in a chunk are (near) identical, synthesize a heuristic spread
-    so later z-scoring doesn't collapse everything to zero.
-    The spread uses semantic tie-breaks: resolvable -> unit -> horn -> fewer lits -> lower arity -> shorter formula.
-    Returns (possibly modified scores_arr, used_spread_flag).
-    """
-    if not scores_arr:
-        return scores_arr, False
-    vals = [float(x.get("score", 0.0)) for x in scores_arr]
-    if (max(vals) - min(vals)) >= eps:
-        return scores_arr, False
-
-    # Build a robust ranking over the *chunk clauses* using semantic hints
-    by_id = {int(c["id"]): c for c in chunk}
-    def key(c: Dict[str, Any]) -> Tuple:
-        tags = c.get("_sem_tags", []) or []
-        f = c.get("features", {}) or {}
-        resolv = any(isinstance(t, str) and t.startswith("resolvable:") for t in tags)
-        unit = ("unit" in tags)
-        horn = bool(f.get("horn"))
-        litc = int(f.get("lit_count", 10**9))
-        arity = int(f.get("max_func_arity", 10**9))
-        clen = len(c.get("canonical_formula", "") or "")
-        # Lower tuple is better; resolvable/unit/horn are promoted
-        return (0 if resolv else 1, 0 if unit else 1, 0 if horn else 1, litc, arity, clen)
-
-    # Sort chunk by the heuristic and assign a linear ramp in [1..0]
-    ordered = sorted((by_id.get(int(x["id"])) for x in scores_arr if int(x["id"]) in by_id), key=key)
-    n = len(ordered)
-    if n <= 1:
-        return ([{"id": int(ordered[0]["id"]), "score": 1.0}] if n == 1 else scores_arr), True
-
-    ramp = [(c["id"], (n - i - 1) / (n - 1)) for i, c in enumerate(ordered)]
-    new_scores = [{"id": int(cid), "score": float(sc)} for cid, sc in ramp]
-    return new_scores, True
+    # 保留以备兼容，但不再对扁平分数做扩散（简化版不需要）
+    return scores_arr, False
 
 def sym_keys(clause: Dict[str, Any]) -> set:
     return set(clause.get("local_symbols", {}).keys())
@@ -412,29 +576,23 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
         tag_str = ", ".join(tags) if tags else ""
         return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
     lines = "\n".join(_line(c) for c in chunk)
+    example = """
+{
+  "scores": [
+    {"id": 12345, "score": 42, "why": "unit resolvable"},
+    {"id": 23456, "score": 5,  "why": "no bridge"}
+  ]
+}
+""".strip()
     return f"""
-你是 ATP 子句打分器。请基于**推理可用性**而非“频度/重合度/长度”对候选打分。
-- **分值范围**：0–10 的实数，至少保留两位小数；
-- **评分依据（只允许这些）**：
+你是 ATP 子句打分器。请仅基于推理可用性为每个候选打分，并输出紧凑 JSON。
+- 分值范围：0–50 的整数或小数；
+- 评分依据（精简版，仅参考）：
   1) 与【目标前沿】的可解性（resolvable:*），是否能一跳解析/关闭；
-  2) 等式可重写潜力（eq + rewrite 直觉）；
-  3) Horn 规则可实例化潜力（horn）；
-  4) SAT 观测（sat_support / sat_pressure）仅作**微调**，不得喧宾夺主；
-- **硬性规则（Bridge 约束）**：
-  A) 若候选至少一侧可与猜想目标项**直接统一**或能被等式**一跳重写**到目标式样，显著加分；
-  B) 若候选仅为 `F*/... =/!= C*` 这类“等于常量/不等于常量”，且看不到把目标项一跳桥接到该常量的规则链，则强烈降权（此类通常偏题）；
-  C) 等式方向优先：能让目标项**复杂→简单**、或消顶符号/合一参数者优先。
-- **分档指引（用于拉开分数）**：
-  9–10：可与目标一侧直接互补/解析，或一跳重写/实例化即可推进；
-  7–8：Horn 结论可统一目标（前提短），或具备多个有效重写位点；
-  4–6：间接相关（需≥2步桥接）或弱重写；
-  0–3：与目标两侧**无桥接**，或纯 `...=/!=常量` 且无可见桥接。
-- **并列打破顺序**（仅当分值恰好相同）：
-  1) unit 且 resolvable 优先；
-  2) 文字数（lit_count）更少者优先；
-  3) max_func_arity 更低者优先；
-  4) Horn 优先；EPR 优先；
-  5) canonical_formula 更短者优先。
+  2) 等式重写潜力（eq + 一跳 rewrite）；
+  3) Horn 可实例化潜力（horn）；
+  4) SAT 观测（sat_support / sat_pressure）仅作微调。
+- 只输出 JSON，不要额外文字。每条包含 id、score、why（极短理由，≤12字）。
 
 【目标前沿（抽象）】
 {goal_text}
@@ -453,65 +611,10 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
 
 【待评分子句（每条含 tags + 公式）】
 {lines}
+
+【输出示例】
+{example}
 """.strip()
-
-# ----------------------- Heuristics -------------------------
-
-def compute_overlap(conj_syms: set, clause: Dict[str, Any]) -> float:
-    s = sym_keys(clause)
-    if not conj_syms:
-        return 0.0
-    return len(s & conj_syms) / max(1, len(conj_syms))
-
-def pick_context_for_summary(ctx: List[Dict[str, Any]], K: int = 64) -> List[Dict[str, Any]]:
-    def key(c: Dict[str, Any]):
-        f = c.get("features", {})
-        return (
-            f.get("conj_dist", 10**9),
-            0 if f.get("horn") else 1,
-            0 if f.get("epr") else 1,
-            len(c.get("canonical_formula", "")),
-            -c.get("_ovlp", 0.0),
-        )
-    return sorted(ctx, key=key)[:K]
-
-def make_chunks(cands: List[Dict[str, Any]], chunk_payload_size: int, anchors: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    anchor_ids = {a["id"] for a in anchors}
-    # Exclude anchors from the main pool to avoid duplicate scoring within a chunk
-    pool = [c for c in cands if c["id"] not in anchor_ids]
-
-    # Split pool into payload-sized chunks
-    chunks: List[List[Dict[str, Any]]] = [pool[i:i+chunk_payload_size] for i in range(0, len(pool), chunk_payload_size)]
-
-    def _append_anchors(cap: int, items: List[Dict[str, Any]]):
-        """Append anchors to items up to cap, without duplicate IDs."""
-        used = {x["id"] for x in items}
-        for a in anchors:
-            if len(items) >= cap:
-                break
-            if a["id"] in used:
-                continue
-            items.append(a)
-            used.add(a["id"])
-
-    # Normal case: extend each chunk with anchors (dedup, respect size)
-    for ch in chunks:
-        _append_anchors(chunk_payload_size, ch)
-
-    # Edge case: if no chunks were created (e.g., pool empty or all candidates selected as anchors),
-    # build a single chunk from candidates and ensure anchors are included, respecting the size limit.
-    if not chunks:
-        base = list(pool) if pool else list(cands)
-        base = base[:chunk_payload_size]
-        _append_anchors(chunk_payload_size, base)
-        # If still empty (no candidates), but anchors exist, fall back to anchors-only chunk
-        if not base and anchors:
-            base = anchors[:min(len(anchors), chunk_payload_size)]
-        # Only create a chunk if we have something to score
-        if base:
-            chunks = [base]
-
-    return chunks
 
 # -------------------------- LLM -----------------------------
 
@@ -550,7 +653,12 @@ class LLMClient:
             if ("ATP 子句打分器" in text) or ("子句打分器" in text):
                 # Robustly extract IDs even if bullets/colons vary
                 ids = [int(m) for m in re.findall(r"ID\s+(\d+)", text)]
-                payload = {"scores": [{"id": i, "score": round(random.random(), 3)} for i in ids]}
+                # produce 0..50 scores with tiny bias by id
+                payload = {
+                    "scores": [
+                        {"id": i, "score": int((i % 51)), "why": "mock"} for i in ids
+                    ]
+                }
                 return json.dumps(payload, ensure_ascii=False)
             # Otherwise treat it as a summary prompt
             return "(占位) 背景摘要：…"
@@ -606,158 +714,23 @@ class LLMClient:
 # ---------------------- Normalization ----------------------
 
 def normalize_and_align(chunks_json: List[Dict[str, Any]], anchor_ids: List[int]) -> Dict[int, float]:
-    # 1) per-chunk z-score normalize
-    per_chunk: List[Dict[int, float]] = []
-    for js in chunks_json:
-        arr = js.get("scores", [])
-        vals = [float(x.get("score", 0.0)) for x in arr]
-        mu = mean(vals) if vals else 0.0
-        sd = pstdev(vals) if len(vals) > 1 else 1.0
-        if sd == 0: sd = 1.0
-        per_chunk.append({int(x["id"]): (float(x["score"]) - mu) / sd for x in arr})
-    # 2) global anchor target (average across chunks)
-    anchor_vals: Dict[int, List[float]] = defaultdict(list)
-    for norm in per_chunk:
-        for aid in anchor_ids:
-            if aid in norm:
-                anchor_vals[aid].append(norm[aid])
-    global_anchor = {aid: (sum(v)/len(v) if v else 0.0) for aid, v in anchor_vals.items()}
-    # 3) align each chunk by linear fit a*s+b using anchors
-    aligned: List[Dict[int, float]] = []
-    for norm in per_chunk:
-        xs, ys = [], []
-        for aid in anchor_ids:
-            if aid in norm and aid in global_anchor:
-                xs.append(norm[aid]); ys.append(global_anchor[aid])
-        a, b = 1.0, 0.0
-        if len(xs) >= 2:
-            xbar = sum(xs)/len(xs); ybar = sum(ys)/len(ys)
-            num = sum((x - xbar)*(y - ybar) for x, y in zip(xs, ys))
-            den = sum((x - xbar)**2 for x in xs) or 1.0
-            a = num/den
-            b = ybar - a * xbar
-        elif len(xs) == 1:
-            b = ys[0] - xs[0]
-        aligned.append({cid: a * v + b for cid, v in norm.items()})
-    # 4) aggregate by mean across chunks
+    # 简化：不再做 z-score 或锚点对齐，直接聚合并做全局 min-max 归一化（模型输出应为 0..50）
     bag: Dict[int, List[float]] = defaultdict(list)
-    for al in aligned:
-        for cid, v in al.items():
-            bag[cid].append(v)
-    return {cid: sum(v)/len(v) for cid, v in bag.items()}
-
-
-# ---------------------- Calibration & Jitter ----------------------
-
-def _fun_keys(local_symbols: Dict[str, Any]) -> set:
-    if not isinstance(local_symbols, dict):
-        return set()
-    return {k for k in local_symbols.keys() if isinstance(k, str) and k.startswith("F")}
-
-def _pred_overlap_count(formula: str, goal: Dict[str, Any]) -> int:
-    pos, neg, preds = _candidate_pred_set(formula or "")
-    return len(preds & goal.get("preds", set()))
-
-def calibrate_scores(
-    raw_scores: Dict[int, float],
-    id2clause: Dict[int, Dict[str, Any]],
-    goal: Dict[str, Any],
-    conj_fun_syms: set,
-    scale_hi: float = 100.0,
-    penalty_offtarget_eq: float = 0.2,
-    bump_resolvable: float = 0.6,
-    bump_unit: float = 0.4,
-    bump_horn: float = 0.3,
-    bump_fun_overlap: float = 0.2,
-) -> Tuple[Dict[int, float], Dict[str, Any]]:
-    """Min-max scale to [0,scale_hi], penalize off-target eq-only clauses with no bridge,
-    and add small positive bumps for semantically useful tags. Return (scaled_scores, stats)."""
-    if not raw_scores:
-        return {}, {"note": "empty"}
-
-    vals = list(raw_scores.values())
-    pre_min = min(vals); pre_max = max(vals)
-    pre_mean = sum(vals) / len(vals)
-
-    # Min-max scaling
-    scaled: Dict[int, float] = {}
-    if pre_max - pre_min > 1e-12:
-        for cid, v in raw_scores.items():
-            scaled[cid] = (v - pre_min) / (pre_max - pre_min) * scale_hi
-    else:
-        # Flat case: start everyone from the midpoint; later jitter will separate.
-        mid = 0.5 * scale_hi
-        scaled = {cid: mid for cid in raw_scores.keys()}
-
-    penalized = 0
-    bumped = 0
-
-    for cid, s in list(scaled.items()):
-        c = id2clause.get(cid, {})
-        formula = c.get("canonical_formula", "") or ""
-        tags = c.get("_sem_tags", []) or []
-        loc = c.get("local_symbols", {}) or {}
-
-        has_eq = ("=" in formula)
-        fun_ovlp = len(_fun_keys(loc) & conj_fun_syms)
-        pred_ovlp = _pred_overlap_count(formula, goal)
-
-        # Off-target eq: equality present, but neither goal predicates nor conjecture functions overlap
-        if has_eq and fun_ovlp == 0 and pred_ovlp == 0:
-            s *= penalty_offtarget_eq
-            penalized += 1
-
-        # Positive micro-bumps (small; only for ordering and to help external_score distinguish)
-        bump = 0.0
-        if any(isinstance(t, str) and t.startswith("resolvable:") for t in tags):
-            bump += bump_resolvable
-        if "unit" in tags:
-            bump += bump_unit
-        if "horn" in tags:
-            bump += bump_horn
-        if fun_ovlp > 0:
-            bump += bump_fun_overlap
-        if bump:
-            s += bump
-            bumped += 1
-
-        scaled[cid] = float(s)
-
-    post_vals = list(scaled.values())
-    post_min = min(post_vals); post_max = max(post_vals)
-    post_mean = sum(post_vals) / len(post_vals)
-
-    stats = {
-        "pre_min": pre_min, "pre_max": pre_max, "pre_mean": pre_mean,
-        "post_min": post_min, "post_max": post_max, "post_mean": post_mean,
-        "penalized_offtarget_eq": penalized, "bumped_semantic": bumped,
-        "scale_hi": scale_hi,
-    }
-    return scaled, stats
-
-def apply_groupwise_jitter(sorted_items: List[Tuple[int, float]], eps: float = 1e-6) -> List[Tuple[int, float]]:
-    """Within groups of (nearly) equal scores, add decreasing tiny jitter so numbers are strictly ordered.
-    `sorted_items` must already be in the desired final order (after tie-break rules)."""
-    if not sorted_items:
-        return sorted_items
-    out: List[Tuple[int, float]] = []
-    i = 0
-    n = len(sorted_items)
-    while i < n:
-        j = i + 1
-        base = sorted_items[i][1]
-        # find group with almost equal scores
-        while j < n and abs(sorted_items[j][1] - base) <= 1e-12:
-            j += 1
-        # apply jitter within [i, j)
-        group = sorted_items[i:j]
-        g = len(group)
-        for k, (cid, sc) in enumerate(group):
-            # earlier items (better by tie-break) get slightly higher jitter
-            jittered = sc + eps * (g - k)
-            out.append((cid, jittered))
-        i = j
-    return out
+    for js in chunks_json:
+        for x in js.get("scores", []):
+            try:
+                bag[int(x["id"])].append(float(x["score"]))
+            except Exception:
+                pass
+    # 平均
+    agg = {cid: (sum(v)/len(v)) for cid, v in bag.items() if v}
+    if not agg:
+        return {}
+    vals = list(agg.values())
+    vmin, vmax = min(vals), max(vals)
+    if abs(vmax - vmin) < 1e-12:
+        return {cid: 0.5 for cid in agg.keys()}
+    return {cid: (sc - vmin) / (vmax - vmin) for cid, sc in agg.items()}
 
 # --------------------------- Main ---------------------------
 
@@ -882,41 +855,29 @@ def main():
     # Provide reasoning context to the client
     llm.set_reasoning_context(goal_text, rules_text)
 
-    # anchors: semantic anchor selection with fallback
-    # Choose anchors conservatively for small candidate sets to avoid the "all anchors, empty pool" degenerate case.
-    # Effective anchors: at most len(cands)-1 so there's always some non-anchor payload (when possible).
-    requested_A = max(0, int(args.anchors))
-    A = min(requested_A, max(0, len(cands) - 1))
-    anchors = select_anchors_semantic(cands, A, goal)
-    if len(anchors) < A:
-        # fallback to previous overlap-based anchors to fill remaining slots
-        rest = [c for c in cands if c not in anchors]
-        extra = sorted(rest, key=lambda c: (-c.get("_ovlp", 0.0), len(c.get("canonical_formula", ""))))[:(A - len(anchors))]
-        anchors = anchors + extra
-    anchor_ids = [a["id"] for a in anchors]
+    # anchors: 简化版不使用 anchors
+    requested_A = 0
+    anchors: List[Dict[str, Any]] = []
+    anchor_ids: List[int] = []
 
-    # chunking
+    # chunking（不带 anchors）
     chunks = make_chunks(cands, args.chunk_size, anchors)
     if args.verbose:
-        pool_size = sum(1 for c in cands if c["id"] not in set(anchor_ids))
+        pool_size = len(cands)
         print(f"[DEBUG] anchors={len(anchor_ids)} pool={pool_size} chunks={len(chunks)}")
         if chunks:
-            print(f"[DEBUG] chunk[0] size={len(chunks[0])} (payload+anchors)")
+            print(f"[DEBUG] chunk[0] size={len(chunks[0])}")
 
-    # per-chunk scoring
+    # per-chunk scoring（保持 artifacts 输出）
     chunk_dir = os.path.join(out_dir, "chunks")
     os.makedirs(chunk_dir, exist_ok=True)
 
     chunk_results: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks):
-        # Choose model based on chunk size
         use_small = len(ch) < SMALL_BATCH_THRESHOLD
-        client = llm
-        if use_small:
-            if llm_small is None:
-                llm_small = LLMClient(model=SMALL_BATCH_MODEL, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
-                # ensure it has the same reasoning context
-                # (set below once goal_text/rules_text are available)
+        client = llm_small if (use_small and llm_small is not None) else llm
+        if use_small and llm_small is None:
+            llm_small = LLMClient(model=SMALL_BATCH_MODEL, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
             client = llm_small
         if args.progress:
             mdl = getattr(client, "model", "?")
@@ -924,144 +885,44 @@ def main():
         prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text, rules_text)
         with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
             pf.write(prompt)
-        if args.verbose:
-            ids_in_prompt = [int(m) for m in re.findall(r"ID\s+(\d+)", prompt)]
-            print(f"[DEBUG] chunk_{idx:03d}: ids_in_prompt={len(ids_in_prompt)}")
-        # Call LLM and persist raw response alongside parsed JSON
-        # Ensure reasoning context is present on chosen client
         client.set_reasoning_context(goal_text, rules_text)
         text = ""
         try:
             text = client._chat(prompt)
         except Exception as e:
-            if use_small:
-                if args.progress:
-                    print(f"[LLM] small-batch model failed: {e}. Falling back to primary model {llm.model}.")
-                try:
-                    client = llm
-                    client.set_reasoning_context(goal_text, rules_text)
-                    text = client._chat(prompt)
-                except Exception as e2:
-                    if args.progress:
-                        print(f"[LLM] primary model also failed: {e2}. Using zero scores for this chunk.")
-                    text = ""
-            else:
-                if args.progress:
-                    print(f"[LLM] model failed: {e}. Using zero scores for this chunk.")
-                text = ""
+            if args.progress:
+                print(f"[LLM] model failed: {e}. Using zero scores for this chunk.")
+            text = ""
         with open(os.path.join(chunk_dir, f"response_{idx:03d}.txt"), "w", encoding="utf-8") as rf:
             rf.write(text)
         parsed = extract_json(text)
         scores_arr = coerce_scores(parsed, ch)
-        # If the chunk is flat (all equal), synthesize a heuristic spread so z-score won't zero-out the signal
         scores_arr, used_spread = spread_if_chunk_flat(scores_arr, ch)
         res = {"scores": scores_arr, "meta": {"model": getattr(client, "model", args.model)}}
-        if used_spread:
-            res["meta"]["flat_chunk_spread"] = True
-        if args.progress:
-            print(f"[LLM]   -> received {len(res.get('scores', []))} scores.")
         save_json(res, os.path.join(chunk_dir, f"chunk_{idx:03d}.json"))
         chunk_results.append(res)
         if args.verbose:
             print(f"[DEBUG] chunk_{idx:03d}: scores={len(res.get('scores', []))}")
-        if res.get("meta", {}).get("flat_chunk_spread"):
-            print(f"[DEBUG] chunk_{idx:03d}: input scores were flat; applied heuristic spread before normalization.")
 
-    # normalize + align across chunks
+    # 简化汇总：全局 min-max 归一化到 0..1
     total_scored = sum(len(js.get("scores", [])) for js in chunk_results)
     if args.verbose:
         print(f"[DEBUG] total_scored entries across chunks: {total_scored}")
     if total_scored == 0:
-        print("[WARN] No scores produced by chunks. Possible reasons: empty candidates; all candidates selected as anchors; or prompt parse failure. Falling back to anchors-only scores (zeros).")
-        fallback_scores = {int(aid): 0.0 for aid in anchor_ids}
-        ranking = sorted(fallback_scores.items(), key=lambda kv: kv[1], reverse=True)
-        result = {
-            "meta": {
-                "model": args.model,
-                "temperature": args.temperature,
-                "chunk_size": args.chunk_size,
-                "anchors": args.anchors,
-                "context_summary_k": args.context_summary_k,
-                "summary_max_tokens": args.summary_max_tokens,
-                "dry_run": args.dry_run,
-                "timestamp": int(time.time()),
-                "debug": {
-                    "context": len(ctx),
-                    "candidates": len(cands),
-                    "anchors": len(anchor_ids),
-                    "chunks": len(chunks),
-                    "total_scored": total_scored,
-                }
-            },
-            "conjecture_id": conj.get("id"),
-            "anchor_ids": anchor_ids,
-            "scores": [{"id": int(cid), "score": float(score)} for cid, score in ranking],
-        }
-        save_json(result, args.out)
-        topk = min(20, len(ranking))
-        print(f"Saved {len(ranking)} scores to {args.out} (fallback). Top {topk}:")
-        for i, (cid, sc) in enumerate(ranking[:topk], 1):
-            print(f"  {i:>2}. id={cid}  score={sc:.3f}")
+        print("[WARN] No scores produced by chunks. Saving empty scores.")
+        save_json({"scores": []}, args.out)
         return
 
     final_scores = normalize_and_align(chunk_results, anchor_ids)
-    # Build id -> clause map (context + candidates) for calibration and tie-breaking
-    id2clause: Dict[int, Dict[str, Any]] = {c["id"]: c for c in ctx}
-    id2clause.update({c["id"]: c for c in cands})
 
-    # Conjecture-side function symbols for bridge checks
-    conj_fun_syms = {k for k in (conj.get("local_symbols", {}) or {}).keys() if isinstance(k, str) and k.startswith("F")}
-
-    # Calibrate scores to a wide numeric range and apply semantic adjustments
-    calibrated_scores, calib_stats = calibrate_scores(final_scores, id2clause, goal, conj_fun_syms)
-    final_scores = calibrated_scores
-
-    if args.progress or args.verbose:
-        print(f"[SCALE] pre(min/mean/max)=({calib_stats['pre_min']:.4f}/{calib_stats['pre_mean']:.4f}/{calib_stats['pre_max']:.4f}) "
-              f"-> post(min/mean/max)=({calib_stats['post_min']:.2f}/{calib_stats['post_mean']:.2f}/{calib_stats['post_max']:.2f}); "
-              f"penalized(offtarget_eq)={calib_stats['penalized_offtarget_eq']}, bumped={calib_stats['bumped_semantic']}")
-
-
-    def _tiebreak_tuple(cid: int, score: float):
-        c = id2clause.get(cid, {})
-        ovlp = 0.0
-        if c:
-            ovlp = compute_overlap(conj_syms, c)
-        f = c.get("features", {}) if c else {}
-        conjd = f.get("conj_dist", 10**9)
-        hornp = 0 if f.get("horn") else 1
-        eprp = 0 if f.get("epr") else 1
-        clen = len(c.get("canonical_formula", "")) if c else 10**9
-        # Primary sort: score DESC; then: overlap DESC; conj_dist ASC; horn True first; epr True first; shorter clause first
-        return (-score, -ovlp, conjd, hornp, eprp, clen)
-
-    ranking_items = [(int(cid), float(sc)) for cid, sc in final_scores.items()]
-    ranking_items.sort(key=lambda kv: _tiebreak_tuple(kv[0], kv[1]))
-    # Make numeric scores strictly ordered within ties to help iProver's external_score
-    ranking_items = apply_groupwise_jitter(ranking_items, eps=1e-6)
-
-    # If scores are degenerate (all equal or near-equal), spread them by rank to avoid all zeros reaching iProver.
-    def _spread_if_degenerate(items):
-        if not items:
-            return items, False
-        vals = [v for _, v in items]
-        if (max(vals) - min(vals)) < 1e-9:
-            n = len(items)
-            if n == 1:
-                return [(items[0][0], 1.0)], True
-            # Map ranks to [1.0 .. 0.0]
-            mapped = [(cid, (n - i - 1) / (n - 1)) for i, (cid, _) in enumerate(items)]
-            return mapped, True
-        return items, False
-
-    ranking, used_spread_fallback = _spread_if_degenerate(ranking_items)
-    models_used = sorted({js.get("meta", {}).get("model", args.model) for js in chunk_results})
+    # 输出（按分数降序）
+    ranking_items = sorted(((int(cid), float(sc)) for cid, sc in final_scores.items()), key=lambda kv: kv[1], reverse=True)
     result = {
         "meta": {
             "model": args.model,
             "temperature": args.temperature,
             "chunk_size": args.chunk_size,
-            "anchors": args.anchors,
+            "anchors": 0,
             "context_summary_k": args.context_summary_k,
             "summary_max_tokens": args.summary_max_tokens,
             "dry_run": args.dry_run,
@@ -1069,23 +930,18 @@ def main():
             "debug": {
                 "context": len(ctx),
                 "candidates": len(cands),
-                "anchors": len(anchor_ids),
+                "anchors": 0,
                 "chunks": len(chunks),
-                "requested_anchors": requested_A,
-                "used_spread_fallback": used_spread_fallback,
-                "models_used": models_used,
-                "calibration": calib_stats,
             },
         },
         "conjecture_id": conj.get("id"),
-        "anchor_ids": anchor_ids,
-        "scores": [{"id": int(cid), "score": float(score)} for cid, score in ranking],
+        "anchor_ids": [],  # simplified
+        "scores": [{"id": int(cid), "score": float(score)} for cid, score in ranking_items],
     }
     save_json(result, args.out)
-    # quick view
-    topk = min(20, len(ranking))
-    print(f"Saved {len(ranking)} scores to {args.out}. Top {topk}:")
-    for i, (cid, sc) in enumerate(ranking[:topk], 1):
+    topk = min(20, len(ranking_items))
+    print(f"Saved {len(ranking_items)} scores to {args.out}. Top {topk}:")
+    for i, (cid, sc) in enumerate(ranking_items[:topk], 1):
         print(f"  {i:>2}. id={cid}  score={sc:.3f}")
 
 if __name__ == "__main__":
