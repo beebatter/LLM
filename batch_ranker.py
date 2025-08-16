@@ -994,6 +994,9 @@ def main():
         return
 
     final_scores = normalize_and_align(chunk_results, anchor_ids)
+    vals_dbg = list(final_scores.values())
+    if vals_dbg:
+        print(f"[CAL] global min={min(vals_dbg):.3f} max={max(vals_dbg):.3f} mean={sum(vals_dbg)/len(vals_dbg):.3f}")
 
     # 输出（按分数降序）
     ranking_items = sorted(((int(cid), float(sc)) for cid, sc in final_scores.items()), key=lambda kv: kv[1], reverse=True)
