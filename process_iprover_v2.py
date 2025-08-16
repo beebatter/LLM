@@ -1478,7 +1478,8 @@ def run_ea_server(host: str, port: int, args) -> None:
     # If we only send a NUL without a trailing newline, iProver will block waiting for a line end.
     # Therefore, when 'nul' is selected, we send the exact iProver delimiter "\n\x00\n";
     # otherwise we send a plain newline-only framing.
-    msg_delim = "\n\x00\n" if getattr(args, 'delimiter', 'nul') == 'nul' else "\n"
+    NUL_NEWLINE_DELIM = "\n\x00\n" 
+    msg_delim = NUL_NEWLINE_DELIM if getattr(args, 'delimiter', 'nul') == 'nul' else "\n"
     # stash for logging helper
     setattr(args, '_ea_log_delim', msg_delim)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1488,7 +1489,7 @@ def run_ea_server(host: str, port: int, args) -> None:
     # Make accept interruptible so we can exit promptly after finish
     sock.settimeout(1.0)
     print(f"[EA] logs dir: {run_dir}")
-    print(f"[EA] listening on {host}:{port} (delimiter={'NUL+NEWLINE' if msg_delim=='\n\x00\n' else 'NEWLINE'})")
+    print(f"[EA] listening on {host}:{port} (delimiter={'NUL+NEWLINE' if msg_delim==NUL_NEWLINE_DELIM else 'NEWLINE'})")
 
     shutdown_event = threading.Event()
     # Throttle frequency for SAT ground-literal evaluation (every N rounds)

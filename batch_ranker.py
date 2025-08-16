@@ -247,9 +247,50 @@ def extract_json(text: str) -> dict:
         try:
             return json.loads(text[start:end+1])
         except Exception:
-            return {}
+            pass
+    # Fallback: parse lines like "ID 123: 0.08" into a scores JSON
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    pairs = []
+    for ln in lines:
+        m = re.search(r"ID\s+(\d+)\s*[:：]\s*([-+]?\d+(?:\.\d+)?)", ln)
+        if m:
+            try:
+                pairs.append({"id": int(m.group(1)), "score": float(m.group(2))})
+            except Exception:
+                continue
+    if pairs:
+        return {"scores": pairs}
     return {}
 
+# ----------------------- Heuristics -------------------------
+
+def compute_overlap(conj_syms: set, clause: Dict[str, Any]) -> float:
+    s = sym_keys(clause)
+    if not conj_syms:
+        return 0.0
+    return len(s & conj_syms) / max(1, len(conj_syms))
+
+def pick_context_for_summary(ctx: List[Dict[str, Any]], K: int = 64) -> List[Dict[str, Any]]:
+    def key(c: Dict[str, Any]):
+        f = c.get("features", {})
+        return (
+            f.get("conj_dist", 10**9),
+            0 if f.get("horn") else 1,
+            0 if f.get("epr") else 1,
+            len(c.get("canonical_formula", "")),
+            -c.get("_ovlp", 0.0),
+        )
+    return sorted(ctx, key=key)[:K]
+
+def make_chunks(cands: List[Dict[str, Any]], chunk_payload_size: int, anchors: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    # Simplified: no anchors, split candidates into chunks of given payload size
+    pool = list(cands)
+    if chunk_payload_size <= 0:
+        return [pool] if pool else []
+    chunks: List[List[Dict[str, Any]]] = [pool[i:i+chunk_payload_size] for i in range(0, len(pool), chunk_payload_size)]
+    if not chunks and pool:
+        chunks = [pool[:chunk_payload_size]]
+    return chunks
 
 # ---------------------- Prompt Builders ---------------------
 
@@ -322,11 +363,15 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
     return f"""
 你是 ATP 子句打分器。请仅基于推理可用性为每个候选打分，并输出紧凑 JSON。
 - 分值范围：0–50 的整数或小数；
-- 评分依据（精简版，仅参考）：
-  1) 与【目标前沿】的可解性（resolvable:*），是否能一跳解析/关闭；
-  2) 等式重写潜力（eq + 一跳 rewrite）；
-  3) Horn 可实例化潜力（horn）；
-  4) SAT 观测（sat_support / sat_pressure）仅作微调。
+- 仅基于推理可用性打分（0–50）：
+  A: 45–50 直接触达 F1/3（含 F1 等式/不等式，或一跳可重写到目标式样）
+  B: 30–44 需一跳桥接到 F1（上下文/anchors 可见明确桥接）
+  C: 15–29 结构可用但当前缺桥（投影/置换/读参模板未与 F1 接通）
+  D: 0–14 与目标无关或仅变元自等
+- 优先级：一跳解析/重写 > 注入/观测 > 其他 Horn；禁止使用频度/重合度/长度为理由。
+- 触碰目标符号：凡候选直接出现 F1/3 或一跳改写到 F1/3，显著加分（A 组）。
+- 输出 JSON，仅含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
+
 - 只输出 JSON，不要额外文字。每条包含 id、score、why（极短理由，≤12字）。
 
 【目标前沿（抽象）】
@@ -587,12 +632,14 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
     return f"""
 你是 ATP 子句打分器。请仅基于推理可用性为每个候选打分，并输出紧凑 JSON。
 - 分值范围：0–50 的整数或小数；
-- 评分依据（精简版，仅参考）：
-  1) 与【目标前沿】的可解性（resolvable:*），是否能一跳解析/关闭；
-  2) 等式重写潜力（eq + 一跳 rewrite）；
-  3) Horn 可实例化潜力（horn）；
-  4) SAT 观测（sat_support / sat_pressure）仅作微调。
-- 只输出 JSON，不要额外文字。每条包含 id、score、why（极短理由，≤12字）。
+- 仅基于推理可用性打分（0–50）：
+  A: 45–50 直接触达 F1/3（含 F1 等式/不等式，或一跳可重写到目标式样）
+  B: 30–44 需一跳桥接到 F1（上下文/anchors 可见明确桥接）
+  C: 15–29 结构可用但当前缺桥（投影/置换/读参模板未与 F1 接通）
+  D: 0–14 与目标无关或仅变元自等
+- 优先级：一跳解析/重写 > 注入/观测 > 其他 Horn；禁止使用频度/重合度/长度为理由。
+- 触碰目标符号：凡候选直接出现 F1/3 或一跳改写到 F1/3，显著加分（A 组）。
+- 输出 JSON，仅含 id、score、why（≤12字；如：含F1等式/一跳可重写/有桥可投影/投影缺桥/与目标无桥）。
 
 【目标前沿（抽象）】
 {goal_text}
