@@ -250,6 +250,105 @@ def extract_json(text: str) -> dict:
             return {}
     return {}
 
+
+# ---------------- Score coercion and flat-spread helpers -----------------
+from typing import Any, Tuple
+
+def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize various model output shapes into a list of {id, score} dicts.
+    Accepts:
+      - {"scores": [{"id":..,"score":..}, ...]}
+      - {"scores": {"123": 0.8, "124": 0.2, ...}}
+      - {"123": 0.8, "124": 0.2, ...}   (top-level mapping)
+      - [0.1, 0.2, ...]                 (aligned by order of IDs in `chunk`)
+    Falls back to zeros if nothing usable is found.
+    """
+    ids = [int(c.get("id")) for c in (chunk or []) if "id" in c]
+    out: List[Dict[str, Any]] = []
+
+    # If obj is a dict, try to dig out the "scores" field; otherwise treat the dict as a mapping.
+    data = None
+    if isinstance(obj, dict):
+        data = obj.get("scores", obj)
+    else:
+        data = obj
+
+    # Case 1: list of {"id","score"} dicts
+    if isinstance(data, list) and data and all(isinstance(x, dict) and "id" in x and "score" in x for x in data):
+        for x in data:
+            try:
+                out.append({"id": int(x["id"]), "score": float(x["score"])})
+            except Exception:
+                pass
+        if out:
+            return out
+
+    # Case 2: dict mapping id -> score
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                cid = int(k)
+                sc = float(v)
+                out.append({"id": cid, "score": sc})
+            except Exception:
+                continue
+        if out:
+            return out
+
+    # Case 3: list of scalars aligned with chunk IDs
+    if isinstance(data, list) and data and all(isinstance(x, (int, float, str)) for x in data) and len(ids) == len(data):
+        for cid, val in zip(ids, data):
+            try:
+                out.append({"id": int(cid), "score": float(val)})
+            except Exception:
+                out.append({"id": int(cid), "score": 0.0})
+        if out:
+            return out
+
+    # Fallback: zeros aligned to chunk
+    if ids:
+        return [{"id": int(cid), "score": 0.0} for cid in ids]
+    return out
+
+
+def spread_if_chunk_flat(scores_arr: List[Dict[str, Any]], chunk: List[Dict[str, Any]], eps: float = 1e-9) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    If all scores in a chunk are (near) identical, synthesize a heuristic spread
+    so later z-scoring doesn't collapse everything to zero.
+    The spread uses semantic tie-breaks: resolvable -> unit -> horn -> fewer lits -> lower arity -> shorter formula.
+    Returns (possibly modified scores_arr, used_spread_flag).
+    """
+    if not scores_arr:
+        return scores_arr, False
+    vals = [float(x.get("score", 0.0)) for x in scores_arr]
+    if (max(vals) - min(vals)) >= eps:
+        return scores_arr, False
+
+    # Build a robust ranking over the *chunk clauses* using semantic hints
+    by_id = {int(c["id"]): c for c in chunk}
+    def key(c: Dict[str, Any]) -> Tuple:
+        tags = c.get("_sem_tags", []) or []
+        f = c.get("features", {}) or {}
+        resolv = any(isinstance(t, str) and t.startswith("resolvable:") for t in tags)
+        unit = ("unit" in tags)
+        horn = bool(f.get("horn"))
+        litc = int(f.get("lit_count", 10**9))
+        arity = int(f.get("max_func_arity", 10**9))
+        clen = len(c.get("canonical_formula", "") or "")
+        # Lower tuple is better; resolvable/unit/horn are promoted
+        return (0 if resolv else 1, 0 if unit else 1, 0 if horn else 1, litc, arity, clen)
+
+    # Sort chunk by the heuristic and assign a linear ramp in [1..0]
+    ordered = sorted((by_id.get(int(x["id"])) for x in scores_arr if int(x["id"]) in by_id), key=key)
+    n = len(ordered)
+    if n <= 1:
+        return ([{"id": int(ordered[0]["id"]), "score": 1.0}] if n == 1 else scores_arr), True
+
+    ramp = [(c["id"], (n - i - 1) / (n - 1)) for i, c in enumerate(ordered)]
+    new_scores = [{"id": int(cid), "score": float(sc)} for cid, sc in ramp]
+    return new_scores, True
+
 def sym_keys(clause: Dict[str, Any]) -> set:
     return set(clause.get("local_symbols", {}).keys())
 
@@ -500,11 +599,9 @@ class LLMClient:
     def score_chunk(self, summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]]) -> Dict[str, Any]:
         prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk, self._goal_text, self._rules_text)
         text = self._chat(prompt)
-        obj = extract_json(text)
-        if not obj or "scores" not in obj:
-            ids = [c["id"] for c in chunk]
-            obj = {"scores": [{"id": i, "score": 0.0} for i in ids]}
-        return obj
+        parsed = extract_json(text)
+        coerced = coerce_scores(parsed, chunk)
+        return {"scores": coerced}
 
 # ---------------------- Normalization ----------------------
 
@@ -854,22 +951,21 @@ def main():
                 text = ""
         with open(os.path.join(chunk_dir, f"response_{idx:03d}.txt"), "w", encoding="utf-8") as rf:
             rf.write(text)
-        res = extract_json(text)
-        if not res or "scores" not in res:
-            ids = [c["id"] for c in ch]
-            res = {"scores": [{"id": i, "score": 0.0} for i in ids]}
-        # annotate chunk with model used
-        try:
-            res_meta = res.setdefault("meta", {})
-            res_meta["model"] = getattr(client, "model", args.model)
-        except Exception:
-            pass
+        parsed = extract_json(text)
+        scores_arr = coerce_scores(parsed, ch)
+        # If the chunk is flat (all equal), synthesize a heuristic spread so z-score won't zero-out the signal
+        scores_arr, used_spread = spread_if_chunk_flat(scores_arr, ch)
+        res = {"scores": scores_arr, "meta": {"model": getattr(client, "model", args.model)}}
+        if used_spread:
+            res["meta"]["flat_chunk_spread"] = True
         if args.progress:
             print(f"[LLM]   -> received {len(res.get('scores', []))} scores.")
         save_json(res, os.path.join(chunk_dir, f"chunk_{idx:03d}.json"))
         chunk_results.append(res)
         if args.verbose:
             print(f"[DEBUG] chunk_{idx:03d}: scores={len(res.get('scores', []))}")
+        if res.get("meta", {}).get("flat_chunk_spread"):
+            print(f"[DEBUG] chunk_{idx:03d}: input scores were flat; applied heuristic spread before normalization.")
 
     # normalize + align across chunks
     total_scored = sum(len(js.get("scores", [])) for js in chunk_results)
