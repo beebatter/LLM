@@ -7,3 +7,6 @@ Logs/
 
 # 忽略文件
 ea_exchange.log
+prompts/summary_test_prompt.txt
+.gitignore
+prompts/scoring_test_prompt.txt
