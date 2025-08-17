@@ -96,6 +96,43 @@ def extract_goal_frontier(conjecture_formula: str) -> Dict[str, Any]:
     preds = {p.split('/')[0] for p in (pos | neg)}
     return {"pos": pos, "neg": neg, "preds": preds, "has_eq": ("EQ/2" in pos or "EQ/2" in neg)}
 
+TARGET_FUN_RE = re.compile(r"\b(F\d+)\s*\(")
+CONST_RE = re.compile(r"\bC\d+\b")
+
+def infer_target_info(conjecture_formula: str) -> dict:
+    """
+    从猜想里推断“目标函子/参数格局/关键常量集合”。
+    重点支持：F1/3(C1, C2, C3) != F1/3(C1, C4, C5) 这类 EUF 风格目标。
+    """
+    text = conjecture_formula or ""
+    # 找出出现的 F#/k（通过 /k 或通过括号判断）
+    funs = set(re.findall(r"\b(F\d+/\d+)\b", text))
+    # 兜底：有的式子只写 F1(...) 不带 /3
+    funs |= set(TARGET_FUN_RE.findall(text))
+    # 收集常量
+    goal_consts = set(CONST_RE.findall(text))
+
+    # 粗略解析 F#(a,b,c) 形的三元，抓“首参为常量”的信息（比如 C1）
+    first_arg_consts = set()
+    for m in re.finditer(r"\b(F\d+)\s*\(\s*([A-Z]\d+)\s*,", text):
+        first_arg_consts.add(m.group(2))
+
+    return {
+        "target_functors": sorted(funs),
+        "goal_consts": sorted(goal_consts),
+        "first_arg_consts": sorted(first_arg_consts),
+    }
+
+def format_target_context_text(ti: dict) -> str:
+    parts = []
+    if ti.get("target_functors"):
+        parts.append("target functors: " + ", ".join(ti["target_functors"]))
+    if ti.get("first_arg_consts"):
+        parts.append("first-arg consts: " + ", ".join(ti["first_arg_consts"]))
+    if ti.get("goal_consts"):
+        parts.append("goal consts: " + ", ".join(ti["goal_consts"]))
+    return "\n".join(parts)
+
 def _candidate_pred_set(formula: str) -> Tuple[set, set, set]:
     lits = parse_literals(formula)
     pos = {p for pp, p in lits if pp.startswith('+')}
@@ -124,13 +161,35 @@ def attach_sat_metrics(cands: List[Dict[str, Any]], sat_map: Dict[str, Any]) -> 
             c["_sat_pressure"] = float(pressure)
             c["_sat_n"] = int(n)
 
-def semantic_tags_for_clause(c: Dict[str, Any], goal: Dict[str, Any]) -> List[str]:
+def _count_goal_consts_occurs(s: str, goal_consts: set) -> int:
+    return sum(len(re.findall(rf"\b{re.escape(c)}\b", s)) for c in goal_consts)
+
+def _touches_target_functor(s: str, target_functors: set) -> bool:
+    if not target_functors:
+        return False
+    # 同时兼容 F1/3 与 F1( 的写法
+    return any((tf in s) or re.search(rf"\b{re.escape(tf.split('/')[0])}\s*\(", s) for tf in target_functors)
+
+def _eq_of_target_functor(s: str, target_functors: set) -> bool:
+    if not _touches_target_functor(s, target_functors):
+        return False
+    # 粗判：出现 F#(...) = F#(...) 或 !=
+    return bool(re.search(r"F\d+\s*\([^)]*\)\s*(!=|=)\s*F\d+\s*\(", s))
+
+def _first_arg_in_goal(s: str, first_arg_consts: set) -> bool:
+    if not first_arg_consts:
+        return False
+    # 捕捉 F#(Ck, ... 的格局
+    return any(re.search(rf"\bF\d+\s*\(\s*{re.escape(c)}\s*,", s) for c in first_arg_consts)
+
+def semantic_tags_for_clause(c: Dict[str, Any], goal: Dict[str, Any], target_info: Dict[str, Any]) -> List[str]:
     f = c.get("features", {})
-    s = c.get("canonical_formula", "")
+    s = c.get("canonical_formula", "") or ""
     unit = ('|' not in s)
     has_eq = ("=" in s) or ("EQ/2" in s)
+
+    # 原有：resolvable / horn / eq / sat / goal_pred_overlap
     pos, neg, preds = _candidate_pred_set(s)
-    # resolvable: opposite polarity predicate exists in goal frontier
     resolvable = []
     for p in pos:
         if p in goal.get("neg", set()):
@@ -138,26 +197,40 @@ def semantic_tags_for_clause(c: Dict[str, Any], goal: Dict[str, Any]) -> List[st
     for p in neg:
         if p in goal.get("pos", set()):
             resolvable.append(p)
+
     tags: List[str] = []
-    if unit:
-        tags.append("unit")
-    if has_eq:
-        tags.append("eq")
-    if f.get("horn"):
-        tags.append("horn")
+    if unit: tags.append("unit")
+    if has_eq: tags.append("eq")
+    if f.get("horn"): tags.append("horn")
     if resolvable:
-        # keep at most 3 for brevity
-        short = ','.join(sorted(set(resolvable))[:3])
-        tags.append(f"resolvable:{short}")
-    # SAT metrics
+        tags.append("resolvable:" + ','.join(sorted(set(resolvable))[:3]))
+
     if c.get("_sat_support") is not None:
         tags.append(f"sat_support={c['_sat_support']:.2f}")
     if c.get("_sat_pressure") is not None:
         tags.append(f"sat_pressure={c['_sat_pressure']:.2f}")
-    # overlap with goal predicates (symbolic, polarity-agnostic) just for info, not scoring
     ovlp = len(preds & goal.get("preds", set()))
     tags.append(f"goal_pred_overlap={ovlp}")
+
+    # 新增：目标相关的强信号
+    tfs = set(target_info.get("target_functors", []))
+    first_args = set(target_info.get("first_arg_consts", []))
+    goal_consts = set(target_info.get("goal_consts", []))
+
+    if _touches_target_functor(s, tfs):
+        tags.append("touches_target_functor")
+    if _eq_of_target_functor(s, tfs):
+        tags.append("eq_of_target_functor")
+    if _first_arg_in_goal(s, first_args):
+        tags.append("first_arg_in_goal")
+    k = _count_goal_consts_occurs(s, goal_consts)
+    tags.append(f"shares_goal_consts:{k}")
+
     return tags
+
+def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any], target_info: Dict[str, Any]) -> None:
+    for c in cands:
+        c["_sem_tags"] = semantic_tags_for_clause(c, goal, target_info)
 
 def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any]) -> None:
     for c in cands:
@@ -896,16 +969,22 @@ def main():
             print("[LLM] Summary ready.")
 
     # Semantic helpers: compute goal frontier, rules, attach SAT metrics & semantic tags, set LLM context
+
     conj_formula = conj.get("canonical_formula", "")
+    target_info = infer_target_info(conj_formula)
+    target_text = format_target_context_text(target_info)
+
+    # 把 target_text 拼到 goal_text（不改函数签名，最小侵入）
     goal = extract_goal_frontier(conj_formula)
     goal_text = format_goal_frontier_text(goal)
-    targets_text = format_conjecture_targets_text(conj_targets)
+    if target_text:
+        goal_text = goal_text + "\n" + target_text
     goal_text_with_targets = goal_text + (("\n" + targets_text) if targets_text else "")
     rules_text = build_reasoning_rules_text()
 
     # attach SAT metrics (if any) and compute semantic tags
     attach_sat_metrics(cands, sat_map)
-    compute_and_attach_sem_tags(cands, goal)
+    compute_and_attach_sem_tags(cands, goal, target_info)
 
     # Provide reasoning context to the client
     llm.set_reasoning_context(goal_text_with_targets, rules_text)
