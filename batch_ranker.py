@@ -929,7 +929,7 @@ def main():
     out_dir = os.path.dirname(args.out) or "."
     if out_dir == ".":
         try:
-            logs_root = os.getenv("RANKER_LOG_ROOT") or os.getenv("EA_LOG_ROOT") or "./logs"
+            logs_root = os.getenv("RANKER_LOG_ROOT") or os.getenv("EA_LOG_ROOT") or "./Logs"
             run_base = os.path.join(logs_root, f"Ranker.{os.getpid()}.{int(time.time())}")
             os.makedirs(run_base, exist_ok=True)
             args.out = os.path.join(run_base, os.path.basename(args.out))

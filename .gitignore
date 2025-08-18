@@ -2,6 +2,7 @@
 chunks/
 ea_runs/
 Logs/
+logs/
 .idea/
 .venv/
 
