@@ -939,7 +939,7 @@ def main():
 
     # LLM clients (primary + optional small-batch client)
     llm = LLMClient(model=args.model, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
-    # Use a standard chat-completions model, not a realtime model
+    llm_small = LLMClient(model=SMALL_BATCH_MODEL, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
 
     # Background summary: cache per run using the exact prompt as the key
     os.makedirs(out_dir, exist_ok=True)
