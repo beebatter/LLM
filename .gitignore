@@ -1,7 +1,7 @@
 # 忽略文件夹
 chunks/
 ea_runs/
-Logs/
+logs/
 .idea/
 .venv/
 
