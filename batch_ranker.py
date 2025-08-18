@@ -35,8 +35,13 @@ import time
 from collections import defaultdict
 import hashlib
 import shutil
-from statistics import mean, pstdev
 from typing import Dict, List, Tuple, Any
+
+
+# ------------------------ Module constants ------------------------
+SMALL_BATCH_THRESHOLD = 17
+SMALL_BATCH_MODEL = "gpt-4o-mini"
+
 
 # --------------------------- I/O ---------------------------
 
@@ -228,7 +233,9 @@ def semantic_tags_for_clause(c: Dict[str, Any], goal: Dict[str, Any], target_inf
 
     return tags
 
-def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any], target_info: Dict[str, Any]) -> None:
+def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any], target_info: Dict[str, Any] = None) -> None:
+    if target_info is None:
+        target_info = {}
     for c in cands:
         c["_sem_tags"] = semantic_tags_for_clause(c, goal, target_info)
 
@@ -382,7 +389,6 @@ def make_chunks(cands: List[Dict[str, Any]], chunk_payload_size: int, anchors: L
     if not chunks and pool:
         chunks = [pool[:chunk_payload_size]]
     return chunks
-
 # ---------------------- Prompt Builders ---------------------
 
 def build_symbol_cheatsheet(symbol_map: Dict[str, Any], keys: List[str], max_items: int = 120) -> str:
@@ -555,9 +561,7 @@ class LLMClient:
         parsed = extract_json(text)
         coerced = coerce_scores(parsed, chunk)
         return {"scores": coerced}
-
 # ---------------- Score coercion and flat-spread helpers -----------------
-from typing import Any, Tuple
 
 def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -671,8 +675,17 @@ def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: Lis
     ctx_text = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in ctx_list[:80])
     if prompt_path is None:
         prompt_path = str(pathlib.Path(__file__).parent / "prompts/summary_prompt.txt")
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        template = f.read()
+    template = None
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            template = f.read()
+    except Exception:
+        template = (
+            "你是 ATP 背景摘要器。请在 {{max_tokens}} tokens 以内，基于猜想与上下文，总结可用于后续推理的关键线索。\n\n"
+            "【猜想】\n{{conjecture_formula}}\n\n"
+            "【符号速查表（节选）】\n{{cheatsheet}}\n\n"
+            "【上下文（节选）】\n{{ctx_text}}\n"
+        )
     prompt = template.replace("{{max_tokens}}", str(max_tokens))
     prompt = prompt.replace("{{conjecture_formula}}", conjecture_formula)
     prompt = prompt.replace("{{cheatsheet}}", cheatsheet)
@@ -916,7 +929,8 @@ def main():
     out_dir = os.path.dirname(args.out) or "."
     if out_dir == ".":
         try:
-            run_base = f"/home/ks/LLM/Logs/Ranker.{os.getpid()}.{int(time.time())}"
+            logs_root = os.getenv("RANKER_LOG_ROOT") or os.getenv("EA_LOG_ROOT") or "./logs"
+            run_base = os.path.join(logs_root, f"Ranker.{os.getpid()}.{int(time.time())}")
             os.makedirs(run_base, exist_ok=True)
             args.out = os.path.join(run_base, os.path.basename(args.out))
             out_dir = run_base
@@ -925,10 +939,7 @@ def main():
 
     # LLM clients (primary + optional small-batch client)
     llm = LLMClient(model=args.model, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
-    SMALL_BATCH_THRESHOLD = 17
-    # Use a standard chat-completions model, not a realtime model
-    SMALL_BATCH_MODEL = "o4-mini"
-    llm_small = None  # lazy init
+    llm_small = LLMClient(model=SMALL_BATCH_MODEL, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
 
     # Background summary: cache per run using the exact prompt as the key
     os.makedirs(out_dir, exist_ok=True)
@@ -982,7 +993,7 @@ def main():
     goal_text = format_goal_frontier_text(goal)
     if target_text:
         goal_text = goal_text + "\n" + target_text
-    goal_text_with_targets = goal_text + (("\n" + target_text) if target_text else "")
+    goal_text_with_targets = goal_text
     rules_text = build_reasoning_rules_text()
 
     # attach SAT metrics (if any) and compute semantic tags
@@ -1022,7 +1033,7 @@ def main():
         prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text_with_targets, rules_text)
         with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
             pf.write(prompt)
-        client.set_reasoning_context(goal_text, rules_text)
+        client.set_reasoning_context(goal_text_with_targets, rules_text)
         text = ""
         try:
             text = client._chat(prompt)

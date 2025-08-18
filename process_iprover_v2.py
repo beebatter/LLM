@@ -1594,8 +1594,8 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
 def run_ea_server(host: str, port: int, args) -> None:
     import socket, threading, json, sys, os, time
     state = _EAState()
-    # Derive logs root from env or args; fall back to a local ./logs directory
-    LOGS_ROOT = os.getenv("EA_LOG_ROOT", None) or (args.artifacts_dir if args.artifacts_dir else "./logs")
+    # Hard-code unified logs root and derive a per-run directory
+    LOGS_ROOT = "/home/ks/LLM/Logs"
     run_dir = os.path.join(LOGS_ROOT, f"EA.{port}.{int(time.time())}")
     os.makedirs(run_dir, exist_ok=True)
 
