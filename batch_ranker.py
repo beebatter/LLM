@@ -940,11 +940,6 @@ def main():
     # LLM clients (primary + optional small-batch client)
     llm = LLMClient(model=args.model, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
     # Use a standard chat-completions model, not a realtime model
-<<<<<<< HEAD
-    SMALL_BATCH_MODEL = "o4-mini"
-=======
->>>>>>> 192e46054459241bc4e5a35ecad3053c94532138
-    llm_small = None  # lazy init
 
     # Background summary: cache per run using the exact prompt as the key
     os.makedirs(out_dir, exist_ok=True)
@@ -998,11 +993,7 @@ def main():
     goal_text = format_goal_frontier_text(goal)
     if target_text:
         goal_text = goal_text + "\n" + target_text
-<<<<<<< HEAD
-    goal_text_with_targets = goal_text + (("\n" + target_text) if target_text else "")
-=======
     goal_text_with_targets = goal_text
->>>>>>> 192e46054459241bc4e5a35ecad3053c94532138
     rules_text = build_reasoning_rules_text()
 
     # attach SAT metrics (if any) and compute semantic tags
