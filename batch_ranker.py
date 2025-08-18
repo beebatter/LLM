@@ -389,8 +389,6 @@ def make_chunks(cands: List[Dict[str, Any]], chunk_payload_size: int, anchors: L
     if not chunks and pool:
         chunks = [pool[:chunk_payload_size]]
     return chunks
-
-<<<<<<< HEAD
 # ---------------------- Prompt Builders ---------------------
 
 def build_symbol_cheatsheet(symbol_map: Dict[str, Any], keys: List[str], max_items: int = 120) -> str:
@@ -563,9 +561,6 @@ class LLMClient:
         parsed = extract_json(text)
         coerced = coerce_scores(parsed, chunk)
         return {"scores": coerced}
-=======
->>>>>>> 192e46054459241bc4e5a35ecad3053c94532138
-
 # ---------------- Score coercion and flat-spread helpers -----------------
 
 def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
