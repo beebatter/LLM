@@ -1062,6 +1062,8 @@ def build_canonical_dataset(
             conj_info['formula'], canonicaliser,
             kind_func_terms=kind_funcs, pred_head_set=kind_preds
         )
+        # NOTE: This is the single source of truth for conjecture representation.
+        # Do not rebuild conj_repr later in this function to avoid divergence.
         conj_repr = {
             'id': conj_id,
             'canonical_formula': cformula,
@@ -1105,21 +1107,6 @@ def build_canonical_dataset(
             lits = _kw_split_top_level_disj(cformula)
             record['features']['lit_count'] = len(lits) if lits else 1
         return record
-    # Build conjecture representation
-    conj_repr = None
-    if conjecture_entry is not None:
-        conj_id, conj_info = conjecture_entry
-        cformula, var_map, local_syms = canonicalise_formula(conj_info['formula'], canonicaliser, kind_func_terms=kind_funcs, pred_head_set=kind_preds)
-        conj_repr = {
-            'id': conj_id,
-            'canonical_formula': cformula,
-            'original_formula': conj_info['formula'],
-            'features': conj_info['features'],
-            'variable_mapping': var_map,
-            'local_symbols': {canon: sorted(list(names)) for canon, names in local_syms.items()},
-        }
-        if include_ast:
-            conj_repr['canonical_formula_ast'] = parse_canonical_formula_ast(cformula)
     # Canonicalise context and candidate clauses
     context_clauses = [canonicalise_clause(cid) for cid in context_ids]
     candidate_clauses = [canonicalise_clause(cid) for cid in candidate_ids]
@@ -1168,7 +1155,28 @@ def build_canonical_dataset(
     }
 
 # ====== Reasoning tags helpers (add below parse_canonical_formula_ast) ======
-import re
+# --------- EA helpers: stable send/print routines ---------
+
+def _ea_send(conn, obj, msg_delim: str) -> None:
+    """Send a JSON message to iProver and mirror it to stdout with a stable prefix."""
+    import json
+    try:
+        print(f"[EA OUT] {json.dumps(obj, ensure_ascii=False)}", flush=True)
+    except Exception:
+        pass
+    try:
+        conn.sendall((json.dumps(obj) + msg_delim).encode("utf-8"))
+    except Exception:
+        # If the connection is broken, just ignore; server loop will exit soon.
+        pass
+
+def _ea_print_in(obj) -> None:
+    """Stable input logging to stdout (used for '[EA IN] ...')."""
+    import json
+    try:
+        print(f"[EA IN] {json.dumps(obj, ensure_ascii=False)}", flush=True)
+    except Exception:
+        pass
 
 def _collect_constants_from_canonical(formula: str) -> set[str]:
     return set(re.findall(r"C\d+", formula))
@@ -1586,14 +1594,16 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
 def run_ea_server(host: str, port: int, args) -> None:
     import socket, threading, json, sys, os, time
     state = _EAState()
-    # Hard-code unified logs root and derive a per-run directory
-    LOGS_ROOT = "/home/ks/LLM/Logs"
+    # Derive logs root from env or args; fall back to a local ./logs directory
+    LOGS_ROOT = os.getenv("EA_LOG_ROOT", None) or (args.artifacts_dir if args.artifacts_dir else "./logs")
     run_dir = os.path.join(LOGS_ROOT, f"EA.{port}.{int(time.time())}")
     os.makedirs(run_dir, exist_ok=True)
 
-    # Override args.log_file and args.artifacts_dir to land under run_dir
-    args.log_file = os.path.join(run_dir, "EA.raw.jsonl.nul")
-    args.artifacts_dir = os.path.join(run_dir, "requests")
+    # Default locations under run_dir (respect user-provided values)
+    if not args.log_file:
+        args.log_file = os.path.join(run_dir, "EA.raw.jsonl.nul")
+    if not args.artifacts_dir:
+        args.artifacts_dir = os.path.join(run_dir, "requests")
     os.makedirs(args.artifacts_dir, exist_ok=True)
 
     # Tee stdout to a file capturing console output (use sys.__stdout__ to avoid recursion)
@@ -1655,10 +1665,7 @@ def run_ea_server(host: str, port: int, args) -> None:
             print(f"[EA] connected from {addr}")
             for msg in _ea_iter_json_messages(conn):
                 tag = msg.get("tag")
-                try:
-                    print(f"[EA IN] {json.dumps(msg, ensure_ascii=False)}", flush=True)
-                except Exception:
-                    pass
+                _ea_print_in(msg)
                 if tag == "register_clauses":
                     _ea_handle_register_clauses(state, msg, log_fp)
                 elif tag == "scores_req":
@@ -1697,11 +1704,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                                 log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
                                 log_fp.write(json.dumps(q, ensure_ascii=False) + msg_delim)
                                 log_fp.flush()
-                            try:
-                                print(f"[EA OUT] {json.dumps(q, ensure_ascii=False)}", flush=True)
-                            except Exception:
-                                pass
-                            conn.sendall((json.dumps(q) + msg_delim).encode("utf-8"))
+                            _ea_send(conn, q, msg_delim)
                             # Will send server_queries_end after *_res
                         else:
                             # Throttled: end query window immediately and proceed to scoring
@@ -1710,11 +1713,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                                 log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
                                 log_fp.write(json.dumps(end, ensure_ascii=False) + msg_delim)
                                 log_fp.flush()
-                            try:
-                                print(f"[EA OUT] {json.dumps(end, ensure_ascii=False)}", flush=True)
-                            except Exception:
-                                pass
-                            conn.sendall((json.dumps(end) + msg_delim).encode("utf-8"))
+                            _ea_send(conn, end, msg_delim)
                             # Process pending scores right away
                             if state.pending_scores:
                                 pend = state.pending_scores
@@ -1725,11 +1724,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                                     "component_id": pend.get("component_id"),
                                 }
                                 res = _ea_handle_scores_req(state, msg2, args, log_fp)
-                                try:
-                                    print(f"[EA OUT] {json.dumps(res, ensure_ascii=False)}", flush=True)
-                                except Exception:
-                                    pass
-                                conn.sendall((json.dumps(res) + msg_delim).encode("utf-8"))
+                                _ea_send(conn, res, msg_delim)
                                 state.pending_scores = None
                     else:
                         # No server queries needed, send end immediately and then process scores
@@ -1738,11 +1733,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                             log_fp.write(json.dumps(msg, ensure_ascii=False) + msg_delim)
                             log_fp.write(json.dumps(end, ensure_ascii=False) + msg_delim)
                             log_fp.flush()
-                        try:
-                            print(f"[EA OUT] {json.dumps(end, ensure_ascii=False)}", flush=True)
-                        except Exception:
-                            pass
-                        conn.sendall((json.dumps(end) + msg_delim).encode("utf-8"))
+                        _ea_send(conn, end, msg_delim)
 
                         # Now process the pending scores request
                         if state.pending_scores:
@@ -1754,11 +1745,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                                 "component_id": pend.get("component_id"),
                             }
                             res = _ea_handle_scores_req(state, msg2, args, log_fp)
-                            try:
-                                print(f"[EA OUT] {json.dumps(res, ensure_ascii=False)}", flush=True)
-                            except Exception:
-                                pass
-                            conn.sendall((json.dumps(res) + msg_delim).encode("utf-8"))
+                            _ea_send(conn, res, msg_delim)
                             state.pending_scores = None
                 elif tag == "cls_sat_eval_gr_res":
                     # Some older builds use a typo 'cause_ids' — fall back if needed
@@ -1774,11 +1761,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                     if log_fp is not None:
                         log_fp.write(json.dumps(end, ensure_ascii=False) + msg_delim)
                         log_fp.flush()
-                    try:
-                        print(f"[EA OUT] {json.dumps(end, ensure_ascii=False)}", flush=True)
-                    except Exception:
-                        pass
-                    conn.sendall((json.dumps(end) + msg_delim).encode("utf-8"))
+                    _ea_send(conn, end, msg_delim)
                     # Now score and respond to the earlier scores_req
                     if state.pending_scores:
                         pend = state.pending_scores
@@ -1790,11 +1773,7 @@ def run_ea_server(host: str, port: int, args) -> None:
                             "component_id": pend.get("component_id"),
                         }
                         res = _ea_handle_scores_req(state, msg2, args, log_fp)
-                        try:
-                            print(f"[EA OUT] {json.dumps(res, ensure_ascii=False)}", flush=True)
-                        except Exception:
-                            pass
-                        conn.sendall((json.dumps(res) + msg_delim).encode("utf-8"))
+                        _ea_send(conn, res, msg_delim)
                         state.pending_scores = None
                 # Detect finish/timeout from iProver and request shutdown
                 elif tag in ("szs_result_out", "szs_status_out", "proof_out"):
