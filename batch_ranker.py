@@ -35,8 +35,13 @@ import time
 from collections import defaultdict
 import hashlib
 import shutil
-from statistics import mean, pstdev
 from typing import Dict, List, Tuple, Any
+
+
+# ------------------------ Module constants ------------------------
+SMALL_BATCH_THRESHOLD = 17
+SMALL_BATCH_MODEL = "gpt-4o-mini"
+
 
 # --------------------------- I/O ---------------------------
 
@@ -228,13 +233,11 @@ def semantic_tags_for_clause(c: Dict[str, Any], goal: Dict[str, Any], target_inf
 
     return tags
 
-def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any], target_info: Dict[str, Any]) -> None:
+def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any], target_info: Dict[str, Any] = None) -> None:
+    if target_info is None:
+        target_info = {}
     for c in cands:
         c["_sem_tags"] = semantic_tags_for_clause(c, goal, target_info)
-
-def compute_and_attach_sem_tags(cands: List[Dict[str, Any]], goal: Dict[str, Any]) -> None:
-    for c in cands:
-        c["_sem_tags"] = semantic_tags_for_clause(c, goal)
 
 def select_anchors_semantic(cands: List[Dict[str, Any]], A: int, goal: Dict[str, Any]) -> List[Dict[str, Any]]:
     if A <= 0:
@@ -387,177 +390,8 @@ def make_chunks(cands: List[Dict[str, Any]], chunk_payload_size: int, anchors: L
         chunks = [pool[:chunk_payload_size]]
     return chunks
 
-# ---------------------- Prompt Builders ---------------------
-
-def build_symbol_cheatsheet(symbol_map: Dict[str, Any], keys: List[str], max_items: int = 120) -> str:
-    rows = []
-    for k in sorted(keys)[:max_items]:
-        info = symbol_map.get(k)
-        if not info:
-            continue
-        orig = ", ".join(info.get("original", []))
-        rows.append(f"{k} ⇨ {orig}  ({info.get('kind')}, arity={info.get('arity')})")
-    return "\n".join(rows)
-
-def _find_run_root(out_dir: str) -> str:
-    """Best-effort detection of the EA run root directory.
-    We expect args.out like: .../EA.<port>.<ts>/requests/scores_req_xxx/out_scores.json
-    Return the parent of 'requests' if found; otherwise return out_dir.
-    """
-    cur = os.path.abspath(out_dir)
-    # Limit the climb depth to avoid walking to filesystem root indefinitely
-    for _ in range(5):
-        base = os.path.basename(cur)
-        if base == "requests":
-            return os.path.dirname(cur)
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    return os.path.abspath(out_dir)
-
-def _prompt_fingerprint(prompt_text: str) -> str:
-    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-
-def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]], goal_text: str, rules_text: str, prompt_path: str = None) -> str:
-    """
-    构建评分prompt，支持从文件加载模板。
-    prompt_path: 指定prompt模板文件路径，默认为prompts/scoring_prompt.txt。
-    """
-    import pathlib
-    def _merge_tags(c: Dict[str, Any]) -> List[str]:
-        ea_tags = c.get("tags", []) or []
-        sem_tags = c.get("_sem_tags", []) or []
-        merged = []
-        for t in (ea_tags + sem_tags):
-            if t not in merged:
-                merged.append(t)
-        return merged
-    def _line(c: Dict[str, Any]) -> str:
-        tag_str = ", ".join(_merge_tags(c))
-        return f"- ID {c['id']} | tags: [{tag_str}]\n  formula: {c['canonical_formula']}"
-    lines = "\n".join(_line(c) for c in chunk)
-    example = """
-{
-  "scores": [
-    {"id": 12345, "score": 42, "why": "unit resolvable"},
-    {"id": 23456, "score": 5,  "why": "no bridge"}
-  ]
-}
-""".strip()
-    # 默认prompt路径
-    if prompt_path is None:
-        prompt_path = str(pathlib.Path(__file__).parent / "prompts/scoring_prompt.txt")
-    # 读取模板
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        template = f.read()
-    # 替换变量
-    prompt = template.replace("{{goal_text}}", goal_text)
-    prompt = prompt.replace("{{rules_text}}", rules_text)
-    prompt = prompt.replace("{{summary}}", summary)
-    prompt = prompt.replace("{{cheatsheet}}", cheatsheet)
-    prompt = prompt.replace("{{conjecture_formula}}", conjecture_formula)
-    prompt = prompt.replace("{{lines}}", lines)
-    prompt = prompt.replace("{{example}}", example)
-    return prompt
-
-# -------------------------- LLM -----------------------------
-
-class LLMClient:
-    def __init__(self, model: str = "gpt-5", temperature: float = 1.0, dry_run: bool = False, max_retries: int = 3, verbose: bool = False):
-        self.model = model
-        self.temperature = temperature
-        self.dry_run = dry_run
-        self.max_retries = max_retries
-        self.verbose = verbose
-        self._goal_text = ""
-        self._rules_text = ""
-        # Auto-fix temperature for models that require default=1
-        if ("gpt-5" in self.model) and (not self.dry_run) and (temperature != 1.0):
-            self.temperature = 1.0
-            if self.verbose:
-                print("[LLM] Model requires default temperature; overriding to 1.0")
-        self._client = None
-        if not dry_run:
-            try:
-                # New-style SDK
-                from openai import OpenAI  # type: ignore
-                self._client = OpenAI()
-            except Exception:
-                # Old-style SDK fallback
-                try:
-                    import openai  # type: ignore
-                    self._client = openai
-                except Exception:
-                    raise RuntimeError("OpenAI SDK not available. Install `openai` and set OPENAI_API_KEY.")
-
-    def _chat(self, prompt: str) -> str:
-        if self.dry_run:
-            text = prompt.strip()
-            # Detect scoring prompt more flexibly
-            if ("ATP 子句打分器" in text) or ("子句打分器" in text):
-                # Robustly extract IDs even if bullets/colons vary
-                ids = [int(m) for m in re.findall(r"ID\s+(\d+)", text)]
-                # produce 0..50 scores with tiny bias by id
-                payload = {
-                    "scores": [
-                        {"id": i, "score": int((i % 51)), "why": "mock"} for i in ids
-                    ]
-                }
-                return json.dumps(payload, ensure_ascii=False)
-            # Otherwise treat it as a summary prompt
-            return "(占位) 背景摘要：…"
-        last_err = None
-        for _ in range(self.max_retries):
-            if self.verbose:
-                print(f"[LLM] request try {_+1}/{self.max_retries}...")
-            try:
-                # New-style SDK path
-                if hasattr(self._client, "chat"):
-                    resp = self._client.chat.completions.create(
-                        model=self.model,
-                        temperature=self.temperature,
-                        messages=[
-                            {"role": "system", "content": "You are a careful assistant. Always follow the user instructions strictly."},
-                            {"role": "user", "content": prompt},
-                        ],
-                    )
-                    return resp.choices[0].message.content or ""
-                # Old-style SDK path
-                if hasattr(self._client, "ChatCompletion"):
-                    resp = self._client.ChatCompletion.create(
-                        model=self.model,
-                        temperature=self.temperature,
-                        messages=[
-                            {"role": "system", "content": "You are a careful assistant. Always follow the user instructions strictly."},
-                            {"role": "user", "content": prompt},
-                        ],
-                    )
-                    return resp["choices"][0]["message"]["content"]
-            except Exception as e:  # pragma: no cover
-                if self.verbose:
-                    print(f"[LLM] error: {e}. retrying...")
-                last_err = e
-                time.sleep(1.0)
-        raise RuntimeError(f"LLM request failed after retries: {last_err}")
-
-    def set_reasoning_context(self, goal_text: str, rules_text: str) -> None:
-        self._goal_text = goal_text
-        self._rules_text = rules_text
-
-    def summarize(self, conjecture_formula: str, cheatsheet: str, ctx_list: List[Dict[str, Any]], max_tokens: int) -> str:
-        prompt = build_summary_prompt(conjecture_formula, cheatsheet, ctx_list, max_tokens)
-        return self._chat(prompt)
-
-    def score_chunk(self, summary: str, cheatsheet: str, conjecture_formula: str, chunk: List[Dict[str, Any]]) -> Dict[str, Any]:
-        prompt = build_scoring_prompt(summary, cheatsheet, conjecture_formula, chunk, self._goal_text, self._rules_text)
-        text = self._chat(prompt)
-        parsed = extract_json(text)
-        coerced = coerce_scores(parsed, chunk)
-        return {"scores": coerced}
 
 # ---------------- Score coercion and flat-spread helpers -----------------
-from typing import Any, Tuple
 
 def coerce_scores(obj: Any, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -671,8 +505,17 @@ def build_summary_prompt(conjecture_formula: str, cheatsheet: str, ctx_list: Lis
     ctx_text = "\n".join(f"- ID {c['id']}: {c['canonical_formula']}" for c in ctx_list[:80])
     if prompt_path is None:
         prompt_path = str(pathlib.Path(__file__).parent / "prompts/summary_prompt.txt")
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        template = f.read()
+    template = None
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            template = f.read()
+    except Exception:
+        template = (
+            "你是 ATP 背景摘要器。请在 {{max_tokens}} tokens 以内，基于猜想与上下文，总结可用于后续推理的关键线索。\n\n"
+            "【猜想】\n{{conjecture_formula}}\n\n"
+            "【符号速查表（节选）】\n{{cheatsheet}}\n\n"
+            "【上下文（节选）】\n{{ctx_text}}\n"
+        )
     prompt = template.replace("{{max_tokens}}", str(max_tokens))
     prompt = prompt.replace("{{conjecture_formula}}", conjecture_formula)
     prompt = prompt.replace("{{cheatsheet}}", cheatsheet)
@@ -913,7 +756,8 @@ def main():
     out_dir = os.path.dirname(args.out) or "."
     if out_dir == ".":
         try:
-            run_base = f"/home/ks/LLM/Logs/Ranker.{os.getpid()}.{int(time.time())}"
+            logs_root = os.getenv("RANKER_LOG_ROOT") or os.getenv("EA_LOG_ROOT") or "./logs"
+            run_base = os.path.join(logs_root, f"Ranker.{os.getpid()}.{int(time.time())}")
             os.makedirs(run_base, exist_ok=True)
             args.out = os.path.join(run_base, os.path.basename(args.out))
             out_dir = run_base
@@ -922,9 +766,7 @@ def main():
 
     # LLM clients (primary + optional small-batch client)
     llm = LLMClient(model=args.model, temperature=args.temperature, dry_run=args.dry_run, max_retries=args.max_retries, verbose=(args.progress or args.verbose))
-    SMALL_BATCH_THRESHOLD = 17
     # Use a standard chat-completions model, not a realtime model
-    SMALL_BATCH_MODEL = "gpt-4o-mini"
     llm_small = None  # lazy init
 
     # Background summary: cache per run using the exact prompt as the key
@@ -979,7 +821,7 @@ def main():
     goal_text = format_goal_frontier_text(goal)
     if target_text:
         goal_text = goal_text + "\n" + target_text
-    goal_text_with_targets = goal_text + (("\n" + targets_text) if targets_text else "")
+    goal_text_with_targets = goal_text
     rules_text = build_reasoning_rules_text()
 
     # attach SAT metrics (if any) and compute semantic tags
@@ -1019,7 +861,7 @@ def main():
         prompt = build_scoring_prompt(summary, cheatsheet, conj_formula, ch, goal_text_with_targets, rules_text)
         with open(os.path.join(chunk_dir, f"prompt_{idx:03d}.txt"), "w", encoding="utf-8") as pf:
             pf.write(prompt)
-        client.set_reasoning_context(goal_text, rules_text)
+        client.set_reasoning_context(goal_text_with_targets, rules_text)
         text = ""
         try:
             text = client._chat(prompt)
