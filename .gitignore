@@ -5,6 +5,7 @@ Logs/
 logs/
 .idea/
 .venv/
+.idea/
 
 # 忽略文件
 ea_exchange.log
