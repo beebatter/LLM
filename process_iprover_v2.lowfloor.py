@@ -1652,59 +1652,59 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
         batch.setdefault('ea_query_features', {})['sat_solver_exec_result'] = state.last_sat_result
     try:
         
-# --- Prefilter + low-floor scoring (added) ---
-if PREFILTER_ENABLED:
-    selected_ids = _ea_prefilter_select(batch)
-    selected_set = set(int(x) for x in selected_ids)
-    # Build a reduced batch for the LLM
-    reduced_batch = dict(batch)
-    reduced_batch['candidate_clauses'] = [c for c in batch.get('candidate_clauses', []) if int(c.get('id')) in selected_set]
-    # Call ranker on the reduced set
-    selected_scores = _ea_score_with_ranker(
-        reduced_batch,
-        ranker_script=args.ranker,
-        model=args.model,
-        chunk_size=args.chunk_size,
-        anchors=args.anchors,
-        context_summary_k=args.context_summary_k,
-        summary_max_tokens=args.summary_max_tokens,
-        dry_run=args.dry_run,
-        progress=args.progress,
-        verbose=args.verbose,
-        save_prompts=args.save_prompts,
-        artifacts_dir=args.artifacts_dir,
-        python_exec=getattr(args, 'python_exec', None),
-    )
-    # Initialize all as very low floor, then overlay selected
-    scores_map = {int(cid): float(LOW_FLOOR_SCORE) for cid in req_ids}
-    scores_map.update({int(k): float(v) for k, v in selected_scores.items()})
-else:
-    scores_map = _ea_score_with_ranker(
-            batch=batch,
-            ranker_script=args.ranker_script,
-            model=args.model,
-            chunk_size=args.chunk_size,
-            anchors=args.anchors,
-            context_summary_k=args.context_summary_k,
-            summary_max_tokens=args.summary_max_tokens,
-            dry_run=args.dry_run,
-            progress=args.progress,
-            verbose=args.verbose,
-            save_prompts=args.save_prompts,
-            artifacts_dir=args.artifacts_dir,
-            python_exec=getattr(args, 'python_exec', None),
-        )
+        # --- Prefilter + low-floor scoring (added) ---
+        if PREFILTER_ENABLED:
+            selected_ids = _ea_prefilter_select(batch)
+            selected_set = set(int(x) for x in selected_ids)
+            # Build a reduced batch for the LLM
+            reduced_batch = dict(batch)
+            reduced_batch['candidate_clauses'] = [c for c in batch.get('candidate_clauses', []) if int(c.get('id')) in selected_set]
+            # Call ranker on the reduced set
+            selected_scores = _ea_score_with_ranker(
+                reduced_batch,
+                ranker_script=args.ranker,
+                model=args.model,
+                chunk_size=args.chunk_size,
+                anchors=args.anchors,
+                context_summary_k=args.context_summary_k,
+                summary_max_tokens=args.summary_max_tokens,
+                dry_run=args.dry_run,
+                progress=args.progress,
+                verbose=args.verbose,
+                save_prompts=args.save_prompts,
+                artifacts_dir=args.artifacts_dir,
+                python_exec=getattr(args, 'python_exec', None),
+            )
+            # Initialize all as very low floor, then overlay selected
+            scores_map = {int(cid): float(LOW_FLOOR_SCORE) for cid in req_ids}
+            scores_map.update({int(k): float(v) for k, v in selected_scores.items()})
+        else:
+            scores_map = _ea_score_with_ranker(
+                    batch=batch,
+                    ranker_script=args.ranker_script,
+                    model=args.model,
+                    chunk_size=args.chunk_size,
+                    anchors=args.anchors,
+                    context_summary_k=args.context_summary_k,
+                    summary_max_tokens=args.summary_max_tokens,
+                    dry_run=args.dry_run,
+                    progress=args.progress,
+                    verbose=args.verbose,
+                    save_prompts=args.save_prompts,
+                    artifacts_dir=args.artifacts_dir,
+                    python_exec=getattr(args, 'python_exec', None),
+                )
     except Exception as e:
-        # Robust fallback: keep iProver running even if the ranker fails
-        try:
-            print(f"[EA] ranker failed: {e}. Using heuristic fallback for {len(req_ids)} clauses.")
-        except Exception:
-            pass
-        scores_map = _ea_fallback_scores_heuristic(req_ids, state)
+                # Robust fallback: keep iProver running even if the ranker fails
+                try:
+                    print(f"[EA] ranker failed: {e}. Using heuristic fallback for {len(req_ids)} clauses.")
+                except Exception:
+                    pass
+                scores_map = _ea_fallback_scores_heuristic(req_ids, state)
     scores_list = [scores_map.get(cid, 0.0) for cid in req_ids]
-    # Save to cache
+            # Save to cache
     state.scores_cache[cache_key] = list(map(float, scores_list))
-# --- end added block ---
+        # --- end added block ---
 
     # Include component identifiers for robustness across iProver builds
     res: Dict[str, Any] = {"tag": "scores_res", "scores": scores_list}
