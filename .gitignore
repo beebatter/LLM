@@ -6,6 +6,7 @@ logs/
 .idea/
 .venv/
 .idea/
+fof_problems_local/
 
 # 忽略文件
 ea_exchange.log
