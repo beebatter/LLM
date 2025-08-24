@@ -234,7 +234,7 @@ def launch_iprover(problem_path: str, port: int, iprover_bin: str) -> subprocess
         '--sup_passive_queues', '[[+external_score]]',
         problem_path,
     ]
-    return subprocess.Popen(cmd, stdout=None, stderr=None)
+    return subprocess.Popen(cmd, stdout=None, stderr=None, cwd='/home/ks/iprover-master')
 
 
 def collect_dataset_from_log(log_path: str, problem_name: str) -> List[Dict[str, Any]]:
