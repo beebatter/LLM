@@ -1,9 +1,4 @@
 
-# --- Prefilter controls (added) ---
-PREFILTER_ENABLED = True        # If True, only a subset of candidates is sent to the LLM
-LOW_FLOOR_SCORE   = 0.02        # Very low score assigned to filtered-out clauses (0..1 scale)
-# ----------------------------------
-
 """
 this is new version of process_iprover.py
 Utility script to convert iProver interactive mode logs into a format
@@ -73,6 +68,12 @@ from typing import Dict, List, Optional, Tuple
 
 # ---------- Lightweight parser to classify symbols (pred/function/const) ----------
 from typing import Any
+
+
+# --- Prefilter controls (added) ---
+PREFILTER_ENABLED = True        # If True, only a subset of candidates is sent to the LLM
+LOW_FLOOR_SCORE   = 0.02        # Very low score assigned to filtered-out clauses (0..1 scale)
+# ----------------------------------
 
 def _kw_skip_ws(s: str, i: int) -> int:
     n = len(s)
@@ -1544,7 +1545,7 @@ def _ea__token_weight(canonical_formula: str) -> int:
     return tok
 
 
-def _ea_prefilter_select(batch: dict) -> list[int]:
+def _ea_prefilter_select(batch: dict, args=None) -> list[int]:
     r"""
     Choose a focused subset of candidates for LLM scoring.
     Priority:
@@ -1556,7 +1557,24 @@ def _ea_prefilter_select(batch: dict) -> list[int]:
     r"""
     cands = list(batch.get("candidate_clauses", []))
     n = len(cands)
-    tier, K = _ea__size_tier_and_budget(n)
+        # Decide K from args if any prefilter knobs are provided
+    K = None
+    if args is not None and any(getattr(args, x, None) is not None
+                                for x in ("prefilter_drop","prefilter_min_keep","prefilter_top_k")):
+        keep_n = n
+        drop = getattr(args, 'prefilter_drop', None)
+        if drop is not None:
+            df = max(0.0, min(1.0, float(drop)))
+            keep_n = max(0, int(round(n * (1.0 - df))))
+        mk = getattr(args, 'prefilter_min_keep', None)
+        if mk is not None:
+            keep_n = max(keep_n, int(mk))
+        tk = getattr(args, 'prefilter_top_k', None)
+        if tk is not None:
+            keep_n = min(keep_n, int(tk))
+        K = max(0, min(n, keep_n))
+    else:
+        _tier, K = _ea__size_tier_and_budget(n)
 
     # If tiny, just return all
     if K >= n:
@@ -1653,8 +1671,8 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
     try:
         
         # --- Prefilter + low-floor scoring (added) ---
-        if PREFILTER_ENABLED:
-            selected_ids = _ea_prefilter_select(batch)
+        if PREFILTER_ENABLED and not getattr(args, 'no_prefilter', False):
+            selected_ids = _ea_prefilter_select(batch, args)
             selected_set = set(int(x) for x in selected_ids)
             # Build a reduced batch for the LLM
             reduced_batch = dict(batch)
@@ -1662,7 +1680,7 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
             # Call ranker on the reduced set
             selected_scores = _ea_score_with_ranker(
                 reduced_batch,
-                ranker_script=args.ranker,
+                ranker_script=args.ranker_script,
                 model=args.model,
                 chunk_size=args.chunk_size,
                 anchors=args.anchors,
@@ -2012,6 +2030,16 @@ def main(argv: Optional[List[str]] = None) -> None:
                        help='Exit EA automatically when iProver sends final status (e.g., szs_result_out/proof_out) or closes the connection')
     p_srv.add_argument('--no-exit-on-finish', dest='exit_on_finish', action='store_false',
                        help='Do not exit EA automatically when iProver finishes')
+    # Prefilter controls
+    p_srv.add_argument('--no-prefilter', action='store_true',
+                    help='Disable candidate prefiltering and low-floor scoring')
+    p_srv.add_argument('--prefilter-drop', type=float, default=None,
+                    help='Fraction (0..1) of lowest-scored candidates to drop before LLM')
+    p_srv.add_argument('--prefilter-min-keep', type=int, default=None,
+                    help='Minimum number of candidates to keep before LLM')
+    p_srv.add_argument('--prefilter-top-k', type=int, default=None,
+                    help='Keep at most top-K candidates before LLM')
+
 
     args = parser.parse_args(argv)
 

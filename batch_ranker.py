@@ -467,6 +467,181 @@ def build_scoring_prompt(summary: str, cheatsheet: str, conjecture_formula: str,
     prompt = prompt.replace("{{example}}", example)
     return prompt
 
+# ===== Heuristic scorer for dry-run (A/B/C/D + linear table) =====
+import re, json, math
+
+def _parse_chunk_entries_from_prompt(prompt_text: str):
+    """
+    从 scoring prompt 文本里解析出条目：
+      returns: list of dicts: {"id": int, "tags": [..], "formula": str}
+    兼容格式：
+      - ID <num> | tags: [t1, t2, ...]
+        formula: <canonical_formula>
+    """
+    text = prompt_text
+    pattern = re.compile(
+        r"-\s*ID\s*(\d+)\s*\|\s*tags:\s*\[(.*?)\]\s*?\n\s*formula:\s*(.+?)(?=\n-\s*ID|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    out = []
+    for m in pattern.finditer(text):
+        cid = int(m.group(1))
+        raw_tags = m.group(2).strip()
+        formula = m.group(3).strip()
+        tags = []
+        if raw_tags:
+            # split by comma while allowing spaces
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        out.append({"id": cid, "tags": tags, "formula": formula})
+    return out
+
+def _paren_max_depth(s: str) -> int:
+    d = m = 0
+    for ch in s:
+        if ch == "(":
+            d += 1
+            m = max(m, d)
+        elif ch == ")":
+            d -= 1 if d > 0 else 0
+    return m
+
+def _extract_k_from_tags(tags):
+    for t in tags:
+        if t.startswith("shares_goal_consts:"):
+            try:
+                return int(t.split(":", 1)[1])
+            except Exception:
+                return 0
+    return 0
+
+def _has_tag(tags_set, key):
+    # 兼容 = 与 : 形式（如 goal_pred_overlap=1 / shares_goal_consts:2）
+    if key in tags_set:
+        return True
+    if "=" in key:
+        k, v = key.split("=", 1)
+        return any(x.startswith(k + "=") and x.split("=", 1)[1] == v for x in tags_set)
+    return False
+
+def score_clause_heuristic_by_tags(tags, formula: str):
+    """
+    依据你给的“0–50 线性打分表”计算分数并返回 (score:int, why:str)
+    仅用 O(|formula|) 特征；不依赖 LLM。
+    """
+    tags_set = set(tags or [])
+    k = _extract_k_from_tags(tags)
+    # —— 复杂度统计（线性）
+    # weight：用简单近似（符号/括号/逗号计数），并归一化
+    # （若未来你把 num_symb 注到 prompt，也可替换这里）
+    commas = formula.count(",")
+    parens = formula.count("(") + formula.count(")")
+    symbols = len(re.findall(r"\b[FPC]\d+\b|[=]|neq|EQ", formula))
+    weight = commas + parens + symbols
+    weight_norm = int(math.ceil(weight / 6.0))  # 0..8 附近
+    depth = _paren_max_depth(formula)
+
+    S_pos = 0
+    why = ""
+
+    # ---- 正向项 ----
+    if "eq_of_target_functor" in tags_set:
+        S_pos += 32
+        why = why or "含F1等式"      # A1
+
+    # A2 近似：“含重写/解析钩子”：碰到 (EQ|neq) 且 touches_target_functor
+    if (("EQ" in formula) or ("neq" in formula) or any(t.startswith("eq_") for t in tags_set)) and ("touches_target_functor" in tags_set):
+        S_pos += 10
+        why = why or "一跳可重写"
+
+    if "first_arg_in_goal" in tags_set:
+        S_pos += 8
+        why = why or "首参对齐"       # A3
+
+    if "touches_target_functor" in tags_set:
+        S_pos += 12
+        why = why or "含F1"          # B1
+
+    # B2 同余桥：通用近似——当 shares_goal_consts≥2 认为可桥接（若未来提供专门桥接tag，这里可替换）
+    if k >= 2:
+        S_pos += 10                  # B2（近似）
+        why = why or "同投影桥"
+
+    # B3 shares_goal_consts:k 逐个 +2（截断到4）
+    if k > 0:
+        S_pos += min(8, 2 * k)
+        why = why or "含目标常元"
+
+    # B4 goal_pred_overlap=1
+    if _has_tag(tags_set, "goal_pred_overlap=1"):
+        S_pos += 6
+        why = why or "与目标重合"
+
+    # B5 SoS/从猜想后裔（容错：sos/from_conjecture 等）
+    if any(t.lower() in ("sos", "from_conjecture", "desc_of_conj") for t in tags_set):
+        S_pos += 6
+        why = why or "SoS后裔"
+
+    # C1/C2
+    if "unit" in tags_set:
+        S_pos += 3
+        why = why or "unit"
+    if "horn" in tags_set:
+        S_pos += 1
+        why = why or "horn"
+
+    # C3 轻量奖励
+    S_pos += max(0, 8 - weight_norm)
+    if not why and S_pos > 0:
+        why = "轻量优先"
+
+    # ---- 惩罚项 ----
+    S_pen = 0
+
+    # P1 与目标无桥：既不 touches/eq_of，也没 EQ/NEQ，且 k==0
+    touches_or_eq = ("touches_target_functor" in tags_set) or ("eq_of_target_functor" in tags_set)
+    has_eq = ("EQ" in formula) or ("neq" in formula) or any(t.startswith("eq_") for t in tags_set)
+    if (not touches_or_eq) and (not has_eq) and (k == 0):
+        S_pen += 12
+        if not why: why = "与目标无桥"
+
+    # P2 过重
+    if weight_norm > 10:
+        S_pen += (weight_norm - 10)
+        if not why: why = "超重"
+
+    # P3 过深
+    if depth > 3:
+        S_pen += (depth - 3) * 2
+        if not why: why = "过深"
+
+    # P4 变量占比过高（极粗近似：变量符号多且无目标痕迹）
+    var_cnt = len(re.findall(r"\bX\d+\b|[A-Z][a-zA-Z0-9_]*", formula))
+    const_cnt = len(re.findall(r"\bC\d+\b", formula))
+    if (var_cnt >= 2 * (const_cnt + 1)) and (not touches_or_eq) and (k == 0):
+        S_pen += 4
+        if not why: why = "变量过多"
+
+    # P5 明显冗余（X=X / 自等）
+    if re.search(r"\bEQ\s*\(\s*([A-Za-z0-9_]+)\s*,\s*\1\s*\)", formula):
+        S_pen += 3
+        if not why: why = "自等冗余"
+
+    score = int(round(max(0, min(50, S_pos - S_pen))))
+    return score, (why or "other")
+
+def score_chunk_heuristic_from_prompt(prompt_text: str):
+    """
+    从 scoring prompt 抽取条目并给出 {"scores":[{"id":..,"score":..,"why":..},...]} 的结构
+    """
+    entries = _parse_chunk_entries_from_prompt(prompt_text)
+    scores = []
+    for e in entries:
+        s, w = score_clause_heuristic_by_tags(e.get("tags", []), e.get("formula", "") or "")
+        scores.append({"id": int(e["id"]), "score": int(s), "why": w})
+    return {"scores": scores}
+# ===== End heuristic scorer =====
+
+
 # -------------------------- LLM -----------------------------
 
 class LLMClient:
@@ -500,19 +675,14 @@ class LLMClient:
     def _chat(self, prompt: str) -> str:
         if self.dry_run:
             text = prompt.strip()
-            # Detect scoring prompt more flexibly
+            # 评分 prompt：直接走启发式打分（不调用 LLM）
             if ("ATP 子句打分器" in text) or ("子句打分器" in text):
-                # Robustly extract IDs even if bullets/colons vary
-                ids = [int(m) for m in re.findall(r"ID\s+(\d+)", text)]
-                # produce 0..50 scores with tiny bias by id
-                payload = {
-                    "scores": [
-                        {"id": i, "score": int((i % 51)), "why": "mock"} for i in ids
-                    ]
-                }
+                payload = score_chunk_heuristic_from_prompt(text)
                 return json.dumps(payload, ensure_ascii=False)
-            # Otherwise treat it as a summary prompt
-            return "(占位) 背景摘要：…"
+            # 摘要 prompt：给一个占位摘要即可（不影响打分）
+            return "(占位) 背景摘要：候选规模较大，优先考虑触达目标函子与等式桥接。"
+        # ...（其余保持原样）
+
         last_err = None
         for _ in range(self.max_retries):
             if self.verbose:
