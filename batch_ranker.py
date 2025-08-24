@@ -958,21 +958,22 @@ class LLMClient:
                     raise RuntimeError("OpenAI SDK not available. Install `openai` and set OPENAI_API_KEY.")
 
     def _chat(self, prompt: str) -> str:
+        """Chat wrapper with robust heuristic fallback.
+        - If dry_run=True: always use the heuristic scorer for scoring prompts,
+          or a short placeholder for summary prompts.
+        - If API calls fail after retries: fall back to the heuristic scorer
+          instead of returning empty text (which led to 0.0→0.5 after min–max).
+        """
+        def _heuristic_response() -> str:
+            # scoring prompt detection: Chinese marker is present in our prompt builder
+            if ("ATP 子句打分器" in prompt) or ("子句打分器" in prompt):
+                return json.dumps(score_chunk_heuristic_from_prompt(prompt), ensure_ascii=False)
+            # otherwise this is the summary prompt
+            return "(占位) 背景摘要：候选规模较大，优先考虑触达目标函子与等式桥接。"
+
         if self.dry_run:
-            text = prompt.strip()
-            # Detect scoring prompt more flexibly
-            if ("ATP 子句打分器" in text) or ("子句打分器" in text):
-                # Robustly extract IDs even if bullets/colons vary
-                ids = [int(m) for m in re.findall(r"ID\s+(\d+)", text)]
-                # produce 0..50 scores with tiny bias by id
-                payload = {
-                    "scores": [
-                        {"id": i, "score": int((i % 51)), "why": "mock"} for i in ids
-                    ]
-                }
-                return json.dumps(payload, ensure_ascii=False)
-            # Otherwise treat it as a summary prompt
-            return "(占位) 背景摘要：…"
+            return _heuristic_response()
+
         last_err = None
         for _ in range(self.max_retries):
             if self.verbose:
@@ -1005,7 +1006,10 @@ class LLMClient:
                     print(f"[LLM] error: {e}. retrying...")
                 last_err = e
                 time.sleep(1.0)
-        raise RuntimeError(f"LLM request failed after retries: {last_err}")
+        # Fallback on persistent failure: use heuristic to avoid all-0→all-0.5
+        if self.verbose:
+            print(f"[LLM] falling back to heuristic after failures: {last_err}")
+        return _heuristic_response()
 
     def set_reasoning_context(self, goal_text: str, rules_text: str) -> None:
         self._goal_text = goal_text
@@ -1040,7 +1044,8 @@ def normalize_and_align(chunks_json: List[Dict[str, Any]], anchor_ids: List[int]
     vals = list(agg.values())
     vmin, vmax = min(vals), max(vals)
     if abs(vmax - vmin) < 1e-12:
-        return {cid: 0.5 for cid in agg.keys()}
+        # No spread in raw scores (often due to API failure); keep zeros so callers can notice
+        return {cid: 0.0 for cid in agg.keys()}
     return {cid: (sc - vmin) / (vmax - vmin) for cid, sc in agg.items()}
 
 # --------------------------- Main ---------------------------
