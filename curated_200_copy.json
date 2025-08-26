@@ -1,0 +1,376 @@
+{
+  "metadata": {
+    "source": "/home/ks/LLM/fof_problems_from_html.json",
+    "total_available": 488,
+    "selected": 200,
+    "selection_criteria": "domain-proportional with heuristic preference for solvable hints and mid complexity"
+  },
+  "problems": [
+  
+    {
+      "problem_name": "SCT121+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SCT/SCT121+1.p",
+      "domain": "SCT"
+    },
+    {
+      "problem_name": "SCT122+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SCT/SCT122+1.p",
+      "domain": "SCT"
+    },
+    {
+      "problem_name": "SCT123+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SCT/SCT123+1.p",
+      "domain": "SCT"
+    },
+    {
+      "problem_name": "SCT124+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SCT/SCT124+1.p",
+      "domain": "SCT"
+    },
+    {
+      "problem_name": "SCT126+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SCT/SCT126+1.p",
+      "domain": "SCT"
+    },
+    {
+      "problem_name": "SCT127+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SCT/SCT127+1.p",
+      "domain": "SCT"
+    },
+    {
+      "problem_name": "SET010+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SET/SET010+3.p",
+      "domain": "SET"
+    },
+    {
+      "problem_name": "SET606+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SET/SET606+3.p",
+      "domain": "SET"
+    },
+    {
+      "problem_name": "SET661+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SET/SET661+3.p",
+      "domain": "SET"
+    },
+    {
+      "problem_name": "SET672+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SET/SET672+3.p",
+      "domain": "SET"
+    },
+    {
+      "problem_name": "SET682+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SET/SET682+3.p",
+      "domain": "SET"
+    },
+    {
+      "problem_name": "SEU098+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEU/SEU098+1.p",
+      "domain": "SEU"
+    },
+    {
+      "problem_name": "SEU119+2",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEU/SEU119+2.p",
+      "domain": "SEU"
+    },
+    {
+      "problem_name": "SEU242+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEU/SEU242+1.p",
+      "domain": "SEU"
+    },
+    {
+      "problem_name": "SEU252+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEU/SEU252+1.p",
+      "domain": "SEU"
+    },
+    {
+      "problem_name": "SEU362+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEU/SEU362+1.p",
+      "domain": "SEU"
+    },
+    {
+      "problem_name": "SEU387+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEU/SEU387+1.p",
+      "domain": "SEU"
+    },
+    {
+      "problem_name": "SEV517+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEV/SEV517+1.p",
+      "domain": "SEV"
+    },
+    {
+      "problem_name": "SEV522+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SEV/SEV522+1.p",
+      "domain": "SEV"
+    },
+    {
+      "problem_name": "SWB010+2",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB010+2.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB004+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB004+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB008+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB008+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB009+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB009+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB010+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB010+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB012+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB012+3.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB013+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB013+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB014+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB014+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB017+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB017+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB020+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB020+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB023+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB023+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB024+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB024+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB027+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB027+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB028+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB028+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB042+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB042+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB044+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB044+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB046+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB046+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB047+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB047+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWB050+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWB/SWB050+1.p",
+      "domain": "SWB"
+    },
+    {
+      "problem_name": "SWC092+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWC/SWC092+1.p",
+      "domain": "SWC"
+    },
+    {
+      "problem_name": "SWV028+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV028+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV050+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV050+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV055+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV055+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV092+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV092+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV096+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV096+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV098+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV098+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV157+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV157+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV161+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV161+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV167+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV167+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV198+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV198+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV202+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV202+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV237+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV237+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV489+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV489+3.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV491+4",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV491+4.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWV014+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWV/SWV014+1.p",
+      "domain": "SWV"
+    },
+    {
+      "problem_name": "SWW470+5",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW470+5.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW473+5",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW473+5.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW874+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW874+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW900+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW900+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW910+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW910+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW949+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW949+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW960+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW960+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW963+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW963+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW966+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW966+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW967+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW967+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW473+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW473+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW474+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW474+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW096+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW096+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SWW098+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SWW/SWW098+1.p",
+      "domain": "SWW"
+    },
+    {
+      "problem_name": "SYN076+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SYN/SYN076+1.p",
+      "domain": "SYN"
+    },
+    {
+      "problem_name": "SYO604+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SYO/SYO604+1.p",
+      "domain": "SYO"
+    },
+    {
+      "problem_name": "SYO605+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/SYO/SYO605+1.p",
+      "domain": "SYO"
+    },
+    {
+      "problem_name": "TOP040+1",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/TOP/TOP040+1.p",
+      "domain": "TOP"
+    },
+    {
+      "problem_name": "TOP024+3",
+      "file_path": "/home/ks/TPTP-v9.0.0/Problems/TOP/TOP024+3.p",
+      "domain": "TOP"
+    }
+  ]
+}

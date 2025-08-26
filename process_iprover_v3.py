@@ -2000,7 +2000,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_srv = sub.add_parser("serve", help="Run EA server for iProver interactive mode")
     p_srv.add_argument('--host', type=str, default='127.0.0.1')
     p_srv.add_argument('--port', type=int, default=12345)
-    p_srv.add_argument('--ranker-script', type=str, default='/Users/songkunwei/Desktop/LLM/batch_ranker.py', help='Path to batch_ranker.py')
+    p_srv.add_argument('--ranker-script', type=str, default='/home/ks/LLM/batch_ranker.py', help='Path to batch_ranker.py')
     p_srv.add_argument('--python-exec', dest='python_exec', type=str, default=None,
                        help='Python interpreter to run the ranker (default: same as EA sys.executable)')
     p_srv.add_argument('--model', type=str, default='gpt-5', help='LLM model for ranking (passed to ranker)')

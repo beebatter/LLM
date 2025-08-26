@@ -6,7 +6,9 @@ logs/
 .idea/
 .venv/
 .idea/
+datasets/
 fof_problems_local/
+__pycache__/
 
 # 忽略文件
 ea_exchange.log

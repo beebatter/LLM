@@ -56,6 +56,39 @@ labeled dataset for training.
 """
 
 import argparse
+
+from typing import Set
+
+from typing import Set as _Set  # alias to avoid shadowing
+
+
+from typing import Set as _Set  # alias to avoid shadowing
+import re
+
+def extract_proof_ids_from_szs_text(text: str) -> _Set[int]:
+    """Extract clause IDs from the SZS CNFRefutation block (plain text)."""
+    ids: _Set[int] = set()
+    if not text:
+        return ids
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('% SZS output start CNFRefutation'):
+            in_block = True
+            continue
+        if in_block and line.startswith('% SZS output end CNFRefutation'):
+            break
+        if in_block:
+            m = re.search(r"tcf\(\s*c_(\d+)\s*,", line)
+            if m:
+                try:
+                    ids.add(int(m.group(1)))
+                except Exception:
+                    pass
+    return ids
+
 import json
 import os
 import sys
@@ -159,6 +192,19 @@ def parse_log(path: str):
                 except Exception:
                     pass
         # ignore other tags
+    # Fallback: if no proof_out was seen in JSON, try to parse SZS CNFRefutation text
+    # to recover the list of clause IDs used in the proof. This supports non-interactive
+    # proof outputs or logs where only the SZS block was captured.
+    ##__PATCH_FALLBACK_SZS__##
+    if not proof_ids:
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as _f:
+                _text = _f.read()
+            szs_ids = extract_proof_ids_from_szs_text(_text)
+            if szs_ids:
+                proof_ids = set(szs_ids)
+        except Exception:
+            pass
     return clauses, proof_ids, seen
 
 
@@ -170,15 +216,19 @@ def determine_neg_bucket(cid: int, proof_ids: Set[int], seen: Dict[str, Set[int]
     """
     if cid in proof_ids:
         return None
-    # clause was selected as given but not used in proof: hardest negatives
+    # Precedence matters as events overlap. Use the following priority:
+    # 1) given (hardest), 2) simplified, 3) passive-only, 4) never-seen
+    # Rationale: many simplified clauses have also appeared in passive;
+    # classifying passive before simplified would collapse them into passive_only.
+    # Likewise, given_nonproof should take precedence over any later status.
     if cid in seen['given']:
         return 'NEG_given_nonproof'
-    # clause was in passive queues but never given: easier negatives
-    if cid in seen['passive']:
-        return 'NEG_passive_only'
-    # clause was simplified away
+    # simplified away at some point (even if it passed through passive)
     if cid in seen['simplified']:
         return 'NEG_simplified'
+    # clause was in passive queues but never selected as given
+    if cid in seen['passive']:
+        return 'NEG_passive_only'
     # never seen beyond registration
     return 'NEG_never_seen'
 

@@ -74,6 +74,7 @@ import socket
 import subprocess
 import sys
 import time
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -126,6 +127,115 @@ def extract_last_given(log_path: str, limit: int = 32) -> List[int]:
         return []
 
 
+def _build_clause_index(log_path: str) -> Dict[int, Dict[str, Any]]:
+    """Scan the raw EA log and build a mapping: clause_id -> {clause, features}.
+
+    Looks for register_clauses messages and records per-clause text and
+    features. Returns an empty dict on errors or when no entries are found.
+    """
+    index: Dict[int, Dict[str, Any]] = {}
+    if not os.path.exists(log_path):
+        return index
+    try:
+        with open(log_path, "rb") as f:
+            data = f.read()
+        # The EA log typically uses NULs to separate message groups
+        parts = [seg for seg in data.split(b"\x00") if seg.strip()]
+        for segment in parts:
+            for line in segment.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="ignore"))
+                except Exception:
+                    continue
+                if msg.get("tag") == "register_clauses":
+                    for cl in msg.get("clauses", []) or []:
+                        try:
+                            cid = int(cl.get("clause_id"))
+                        except Exception:
+                            continue
+                        entry = {
+                            "clause": cl.get("clause"),
+                            "features": (cl.get("clause_features") or {}),
+                        }
+                        index[cid] = entry
+    except Exception:
+        return index
+    return index
+
+
+def extract_last_given_details(log_path: str, limit: int = 32) -> List[Dict[str, Any]]:
+    """Return details for the most recent given_clause events.
+
+    Each element includes the transient ID (for correlation), the clause text,
+    and its features if available, e.g.::
+
+        {"id": 245, "clause": "tcf(...).", "features": {"born": 3, ...}}
+    """
+    ids = extract_last_given(log_path, limit=limit)
+    if not ids:
+        return []
+    index = _build_clause_index(log_path)
+    details: List[Dict[str, Any]] = []
+    for cid in ids:
+        info = index.get(cid, {})
+        details.append({
+            "id": cid,
+            "clause": info.get("clause"),
+            "features": info.get("features"),
+        })
+    return details
+
+
+
+def extract_sample_passive_details(log_path: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """Return up to `limit` passive-only clause details for failure logs."""
+    try:
+        idx = _build_clause_index(log_path)
+        given: Set[int] = set()
+        passive: Set[int] = set()
+        simplified: Set[int] = set()
+        with open(log_path, "rb") as f:
+            data = f.read()
+        parts = [seg for seg in data.split(b"\x00") if seg.strip()]
+        for segment in parts:
+            for line in segment.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="ignore"))
+                except Exception:
+                    continue
+                tag = msg.get("tag")
+                if tag == "given_clause":
+                    for cid in msg.get("clause_ids", []) or []:
+                        try: given.add(int(cid))
+                        except Exception: pass
+                elif tag == "passive_clauses":
+                    for cid in msg.get("clause_ids", []) or []:
+                        try: passive.add(int(cid))
+                        except Exception: pass
+                elif tag == "simplified_clauses":
+                    for cid in msg.get("clause_ids", []) or []:
+                        try: simplified.add(int(cid))
+                        except Exception: pass
+        cids = [cid for cid in passive if cid not in given and cid not in simplified]
+        items = []
+        for cid in cids:
+            info = idx.get(cid, {})
+            feats = info.get("features") or {}
+            born = feats.get("born", 1<<30)
+            horn = feats.get("horn", False)
+            conj = feats.get("conj_dist", 1<<30)
+            score = (1 if horn else 0) - 0.001*born - 0.0001*conj
+            items.append((score, {"id": cid, "clause": info.get("clause"), "features": feats}))
+        items.sort(key=lambda x: x[0], reverse=True)
+        return [d for _, d in items[:limit]]
+    except Exception:
+        return []
 def log_failure(
     fail_log_path: str,
     *,
@@ -161,8 +271,12 @@ def log_failure(
     }
     if log_path:
         entry["last_given_ids"] = extract_last_given(log_path, limit=32)
+        # Richer context: include the clause texts and features for the last given clauses
+        entry["last_given_clauses"] = extract_last_given_details(log_path, limit=32)
+        entry["passive_sample"] = extract_sample_passive_details(log_path, limit=8)
     else:
         entry["last_given_ids"] = []
+        entry["last_given_clauses"] = []
     _append_jsonl(fail_log_path, entry)
 
 
@@ -178,12 +292,80 @@ def has_proof_out(path: str) -> bool:
         return False
 
 
+def has_szs_success_in_ea_log(path: str) -> bool:
+    """Check EA raw log for a szs_result_out event indicating success.
+
+    Treats either Theorem or Unsatisfiable as success signals.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        # Fast path: look for the tag, then cheaply scan JSON lines
+        if b'"szs_result_out"' not in data:
+            return False
+        for segment in data.split(b"\x00"):
+            for line in segment.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode('utf-8', errors='ignore'))
+                except Exception:
+                    continue
+                if msg.get('tag') == 'szs_result_out':
+                    status = str(msg.get('szs_status') or '')
+                    if re.search(r"SZS\\s+status\\s+(Theorem|Unsatisfiable)\\b", status):
+                        return True
+        return False
+    except Exception:
+        return False
+
 # Import parsers from iplog_to_dataset.  If import fails, augment sys.path.
 try:
     from iplog_to_dataset import parse_log, build_dataset
 except Exception:
     sys.path.append(os.path.dirname(__file__))
     from iplog_to_dataset import parse_log, build_dataset  # type: ignore
+
+
+
+def has_szs_proof(text: str) -> bool:
+    """Detects whether iProver stdout contains a successful proof indication."""
+    if not text:
+        return False
+    if "% SZS output start CNFRefutation" in text:
+        return True
+    # Some runs print only SZS status without the full CNFRefutation block
+    if re.search(r"%\s*SZS\s+status\s+(Theorem|Unsatisfiable)\b", text):
+        return True
+    return False
+
+
+def extract_proof_ids_from_szs_text(text: str) -> Set[int]:
+    """Extract tcf(c_<ID>, ...) IDs from a SZS CNFRefutation block in stdout."""
+    ids: Set[int] = set()
+    if not text:
+        return ids
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("% SZS output start CNFRefutation"):
+            in_block = True
+            continue
+        if in_block and line.startswith("% SZS output end CNFRefutation"):
+            break
+        if in_block:
+            m = re.search(r"tcf\(\s*c_(\d+)\s*,", line)
+            if m:
+                try:
+                    ids.add(int(m.group(1)))
+                except Exception:
+                    pass
+    return ids
 
 
 def find_free_port() -> int:
@@ -215,7 +397,8 @@ def launch_ea(port: int, log_file: str, python_exec: str = sys.executable) -> su
     return subprocess.Popen(cmd, stdout=None, stderr=None)
 
 
-def launch_iprover(problem_path: str, port: int, iprover_bin: str) -> subprocess.Popen:
+def launch_iprover(problem_path: str, port: int, iprover_bin: str,
+                   stdout_path: str, stderr_path: str) -> subprocess.Popen:
     """Run iProver in interactive mode on ``problem_path`` connecting to ``port``."""
     cmd = [
         iprover_bin,
@@ -234,7 +417,10 @@ def launch_iprover(problem_path: str, port: int, iprover_bin: str) -> subprocess
         '--sup_passive_queues', '[[+external_score]]',
         problem_path,
     ]
-    return subprocess.Popen(cmd, stdout=None, stderr=None, cwd='/home/ks/iprover-master')
+    os.makedirs(os.path.dirname(stdout_path) or '.', exist_ok=True)
+    out = open(stdout_path, 'wb')
+    err = open(stderr_path, 'wb')
+    return subprocess.Popen(cmd, stdout=out, stderr=err, cwd='/home/ks/iprover-master')
 
 
 def collect_dataset_from_log(log_path: str, problem_name: str) -> List[Dict[str, Any]]:
@@ -475,6 +661,8 @@ def run_problem(
     problem_name = problem.get('problem_name') or Path(problem.get('file_path')).stem
     problem_path = problem.get('file_path')
     log_file = output_dir / f"{problem_name}.raw.log"
+    iprover_stdout = output_dir / f"{problem_name}.iprover.out"
+    iprover_stderr = output_dir / f"{problem_name}.iprover.err"
     port = find_free_port()
     start_time = time.time()
     failure_reason: Optional[str] = None
@@ -486,7 +674,7 @@ def run_problem(
     time.sleep(0.5)
     try:
         if not simulate:
-            ip_proc = launch_iprover(problem_path, port, iprover_bin)
+            ip_proc = launch_iprover(problem_path, port, iprover_bin, str(iprover_stdout), str(iprover_stderr))
             try:
                 iprover_exit = ip_proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -500,15 +688,27 @@ def run_problem(
         for proc in (ip_proc, ea_proc):
             if proc and proc.poll() is None:
                 proc.kill(); proc.wait()
+    # Read iProver stdout for SZS proof detection
+    szs_text = ''
+    try:
+        if iprover_stdout.exists():
+            szs_text = iprover_stdout.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        szs_text = ''
+
     elapsed = time.time() - start_time
     # Failure determination
     if not simulate:
-        if failure_reason is None and iprover_exit is not None and iprover_exit != 0:
+        szs_ok = has_szs_proof(szs_text) or has_szs_success_in_ea_log(str(log_file))
+        # Non-zero exit is not a failure if SZS indicates success
+        if failure_reason is None and iprover_exit is not None and iprover_exit != 0 and not szs_ok:
             failure_reason = 'iprover_error'
-        if failure_reason is None and iprover_exit == 0 and not has_proof_out(str(log_file)):
+        # Zero exit but no proof markers anywhere -> no_proof
+        if failure_reason is None and iprover_exit == 0 and not (has_proof_out(str(log_file)) or szs_ok):
             failure_reason = 'no_proof'
     else:
-        if not has_proof_out(str(log_file)):
+        szs_ok = has_szs_proof(szs_text) or has_szs_success_in_ea_log(str(log_file))
+        if not (has_proof_out(str(log_file)) or szs_ok):
             failure_reason = 'no_proof'
     # Record failures
     if failure_reason and fail_log_path:
@@ -532,7 +732,13 @@ def run_problem(
         print(f"Skipped dataset generation for {problem_name} due to failure: {failure_reason}")
         return
     # Build dataset
-    dataset_entries = collect_dataset_from_log(str(log_file), problem_name=problem_name)
+    # Build dataset with SZS fallback: if no proof_out, recover tcf IDs from iProver stdout
+    clauses, proof_ids, seen = parse_log(str(log_file))
+    if not proof_ids and szs_text:
+        szs_ids = extract_proof_ids_from_szs_text(szs_text)
+        if szs_ids:
+            proof_ids = set(szs_ids)
+    dataset_entries = build_dataset(clauses, proof_ids, seen, problem_name=problem_name)
     # Sample negatives if requested
     if not no_sample_negatives:
         frontier_ids = set(extract_last_given(str(log_file), limit=frontier_window))
