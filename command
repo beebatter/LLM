@@ -110,3 +110,35 @@ python3 /home/ks/LLM/process_iprover_v3.py serve \
   --output dataset.jsonl \
   --fail-log failed_problems.jsonl \
   --timeout 300
+
+
+
+  s": {"basic_clause_id": 8826, "conj_dist": -1, "born": 2, "horn": true, "epr": true}}]}
+[EA IN] {"tag": "scores_req", "clause_ids": [9928], "component": "sup", "component_id": 1}
+[EA IN] {"tag": "server_queries_start"}
+[EA OUT] {"tag": "server_queries_end"}
+[EA] ranker python: /home/ks/Proof-Guidance-for-Automated-Theorem-Proving-Using-Large-Language-Models/LLM/LLM_py311/bin/python3
+[DEBUG] clauses: context=128, candidates=1
+[LLM] Using cached background summary.
+[DEBUG] anchors=0 pool=1 chunks=1
+[DEBUG] chunk[0] size=1
+[LLM] Scoring chunk 1/1 (size=1) with model=gpt-4o-mini...
+[DEBUG] chunk_000: scores=1
+[DEBUG] total_scored entries across chunks: 1
+[CAL] global min=0.948 max=0.948 mean=0.948
+Saved 1 scores to /home/ks/LLM/Logs/EA.57437.1756133650/requests/scores_req_1756133705427_1_0ffceb2f/out_scores.json. Top 1:
+   1. id=9928  score=0.948
+[EA] artifacts saved under: /home/ks/LLM/Logs/EA.57437.1756133650/requests/scores_req_1756133705427_1_0ffceb2f
+[EA OUT] {"tag": "scores_res", "scores": [0.9484638255698712], "component": "sup", "component_id": 1}
+Exception in thread Thread-1 (handle):
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/threading.py", line 1045, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.11/threading.py", line 982, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/ks/LLM/process_iprover_v3.py", line 1816, in handle
+    for msg in _ea_iter_json_messages(conn):
+  File "/home/ks/LLM/process_iprover_v3.py", line 1394, in _ea_iter_json_messages
+    chunk = conn.recv(8192)
+            ^^^^^^^^^^^^^^^
+ConnectionResetError: [Errno 104] Connection reset by peer
