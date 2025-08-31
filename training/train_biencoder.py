@@ -205,7 +205,7 @@ def main(argv: List[str] | None = None) -> int:
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(total/max(1,n)):.4f}")
         avg_loss = total / max(1, n)
         writer.add_scalar("train/loss_epoch", avg_loss, ep)
-    r64, topk_curve, recalls_by_bucket, pos_scores, neg_scores, buckets = eval_recall(model, val_loader, device, topk=64)
+        r64, topk_curve, recalls_by_bucket, pos_scores, neg_scores, buckets = eval_recall(model, val_loader, device, topk=64)
         writer.add_scalar("val/recall@64", r64, ep)
         history["train_loss"].append(avg_loss)
         history["val_R@64"].append(r64)
