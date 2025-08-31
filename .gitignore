@@ -9,6 +9,8 @@ logs/
 datasets/
 fof_problems_local/
 __pycache__/
+proves/
+data/
 
 # 忽略文件
 ea_exchange.log
