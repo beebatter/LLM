@@ -11,6 +11,7 @@ fof_problems_local/
 __pycache__/
 proves/
 data/
+tmp/
 
 # 忽略文件
 ea_exchange.log
