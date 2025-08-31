@@ -15,6 +15,11 @@ from LLM.models.logic_transformers import BiEncoder, TransformerConfig
 from LLM.training.biencoder_datasets import build_bi_dataloader
 from LLM.training.vis_utils import plot_curves, save_metrics_json, plot_hist, plot_bucket_box, save_bucket_recalls, plot_topk_curve
 
+try:
+    import sentencepiece as spm  # type: ignore
+except Exception:
+    spm = None  # will fallback to .vocab file only
+
 
 class InfoNCE(nn.Module):
     def __init__(self, temperature: float = 0.07):
@@ -31,8 +36,9 @@ class InfoNCE(nn.Module):
 
 
 @torch.no_grad()
-def eval_recall(model: BiEncoder, loader, device: torch.device, topk: int = 64):
+def eval_recall(model: BiEncoder, loader, device: torch.device, topk: int = 64, neg_per_query: int = 16, max_neg_samples: int = 50000):
     model.eval()
+    # First pass: encode all pairs
     all_q, all_d, all_bucket = [], [], []
     for batch in loader:
         q_ids = batch["q_ids"].to(device)
@@ -41,33 +47,82 @@ def eval_recall(model: BiEncoder, loader, device: torch.device, topk: int = 64):
         d_mask = batch["d_mask"].to(device)
         q = model.encode(q_ids, q_mask, which="q")
         d = model.encode(d_ids, d_mask, which="d")
-        all_q.append(q)
-        all_d.append(d)
+        all_q.append(q.detach())
+        all_d.append(d.detach())
         if "bucket" in batch:
-            all_bucket += batch["bucket"]
+            all_bucket += list(batch["bucket"])  # type: ignore
     Q = torch.cat(all_q, dim=0)
     D = torch.cat(all_d, dim=0)
     Q = nn.functional.normalize(Q, dim=1)
     D = nn.functional.normalize(D, dim=1)
-    sims = Q @ D.t()  # [N, N]
-    max_k = min(topk, D.size(0))
-    vals, idx = sims.topk(k=max_k, dim=1, largest=True)
-    gold = torch.arange(D.size(0), device=idx.device).unsqueeze(1)
-    hits_k = (idx == gold).float()
-    recall_at_k = hits_k.cumsum(dim=1).clamp(max=1.0).mean(dim=0)  # [K]
-    recall64 = float(recall_at_k[max_k - 1].item()) if max_k > 0 else 0.0
 
-    # per-bucket recall (at K=max_k)
-    recalls_by_bucket = {}
-    if all_bucket and len(all_bucket) == sims.size(0):
-        hit_last = hits_k.cumsum(dim=1).clamp(max=1.0)[:, max_k - 1] if max_k > 0 else torch.zeros(sims.size(0))
-        from collections import defaultdict
-        agg = defaultdict(list)
-        for b, h in zip(all_bucket, hit_last.cpu().tolist()):
-            agg[b].append(h)
-        recalls_by_bucket = {k: float(sum(v) / max(1, len(v))) for k, v in agg.items()}
+    N = D.size(0)
+    K = min(topk, N)
+    # Move D to device memory if possible
+    D_dev = D
+    try:
+        if D.device != device:
+            D_dev = D.to(device, non_blocking=True)
+    except RuntimeError:
+        D_dev = D  # fallback
 
-    return recall64, recall_at_k.cpu().tolist(), recalls_by_bucket, sims.cpu(), all_bucket
+    hits_start = torch.zeros(K, dtype=torch.long)
+    pos_scores: List[float] = []
+    neg_scores: List[float] = []
+    bucket_hits = {}
+    bucket_counts = {}
+
+    start = 0
+    for q_batch in torch.split(Q, split_size_or_sections=max(1, 1024 if N > 8192 else 4096), dim=0):
+        bsz = q_batch.size(0)
+        end = start + bsz
+        # compute sims against all docs (B x N) without materializing NxN across all batches
+        sims_bn = (q_batch.to(D_dev.device) @ D_dev.t())  # on device
+        # positive scores: diagonal elements
+        row_idx = torch.arange(bsz, device=sims_bn.device)
+        col_idx = torch.arange(start, end, device=sims_bn.device)
+        pos_scores.extend(sims_bn[row_idx, col_idx].detach().float().cpu().tolist())
+        # top-K indices per row
+        vals, idx = torch.topk(sims_bn, k=K, dim=1, largest=True)
+        # hits@K: find position of gold index
+        gold = torch.arange(start, end, device=idx.device).unsqueeze(1)
+        eq = (idx == gold)
+        # position where gold appears (if any)
+        any_hit = eq.any(dim=1)
+        if any_hit.any():
+            # positions of first True in each row
+            pos = torch.where(eq)[1]  # flattened column indices for True entries
+            # map to per-row position by grouping; simpler: loop small K
+            for r in range(bsz):
+                if any_hit[r]:
+                    p = int(torch.nonzero(eq[r], as_tuple=False)[0, 0].item())
+                    hits_start[p] += 1
+        # bucket stats and negative sampling
+        if all_bucket:
+            for r in range(bsz):
+                b = all_bucket[start + r]
+                bucket_counts[b] = bucket_counts.get(b, 0) + 1
+                # hit at K? reuse any_hit
+                hit = bool(any_hit[r].item())
+                bucket_hits[b] = bucket_hits.get(b, 0) + (1 if hit else 0)
+        # negative sampling: take top negatives (exclude diagonal) limited per query
+        if len(neg_scores) < max_neg_samples:
+            sims_neg = sims_bn.clone()
+            sims_neg[row_idx, col_idx] = float('-inf')
+            kneg = min(neg_per_query, N - 1)
+            if kneg > 0:
+                nv, _ = torch.topk(sims_neg, k=kneg, dim=1, largest=True)
+                neg_scores.extend(nv.detach().float().cpu().flatten().tolist())
+                if len(neg_scores) > max_neg_samples:
+                    neg_scores = neg_scores[:max_neg_samples]
+        start = end
+        # free
+        del sims_bn
+
+    recall_at_k = torch.cumsum(hits_start, dim=0).float().div(max(1, N)).cpu().tolist()
+    recallK = float(recall_at_k[K - 1]) if K > 0 else 0.0
+    recalls_by_bucket = {k: (float(bucket_hits.get(k, 0)) / max(1, v)) for k, v in bucket_counts.items()}
+    return recallK, recall_at_k, recalls_by_bucket, pos_scores, neg_scores, all_bucket
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -87,10 +142,23 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--logdir", type=Path, default=Path("/home/ks/Training/logs/biencoder"))
     args = ap.parse_args(argv)
 
-    # vocab size from spm vocab
-    spm_vocab = Path(args.spm).with_suffix(".vocab")
-    with open(spm_vocab, "r", encoding="utf-8") as f:
-        vocab_size = sum(1 for _ in f)
+    # vocab size from spm model or .vocab fallback
+    vocab_size = None
+    # Try SentencePiece model directly first
+    if spm is not None:
+        try:
+            spp = spm.SentencePieceProcessor()
+            spp.load(str(args.spm))
+            vocab_size = int(spp.get_piece_size())
+        except Exception:
+            vocab_size = None
+    if vocab_size is None:
+        spm_vocab = Path(args.spm).with_suffix(".vocab")
+        try:
+            with open(spm_vocab, "r", encoding="utf-8") as f:
+                vocab_size = sum(1 for _ in f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Cannot infer vocab size: neither {spm_vocab} exists nor can the SPM model be loaded. Check --spm path.")
 
     cfg = TransformerConfig(
         vocab_size=vocab_size,
@@ -137,7 +205,7 @@ def main(argv: List[str] | None = None) -> int:
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(total/max(1,n)):.4f}")
         avg_loss = total / max(1, n)
         writer.add_scalar("train/loss_epoch", avg_loss, ep)
-        r64, topk_curve, recalls_by_bucket, sims_cpu, buckets = eval_recall(model, val_loader, device, topk=64)
+    r64, topk_curve, recalls_by_bucket, pos_scores, neg_scores, buckets = eval_recall(model, val_loader, device, topk=64)
         writer.add_scalar("val/recall@64", r64, ep)
         history["train_loss"].append(avg_loss)
         history["val_R@64"].append(r64)
@@ -153,11 +221,6 @@ def main(argv: List[str] | None = None) -> int:
             print(f"saved: {args.save}")
         # per-epoch optional visuals on small slice
         try:
-            # score histogram uses diagonal as positives and off-diagonal negatives (approx)
-            pos_scores = sims_cpu.diag().tolist()
-            import torch as _T
-            mask = ~_T.eye(sims_cpu.size(0), dtype=torch.bool)
-            neg_scores = sims_cpu[mask].view(sims_cpu.size(0), -1).flatten()[: len(pos_scores) * 50].tolist()
             plot_hist(pos_scores, neg_scores, args.logdir, name=f"score_hist_ep{ep}.png")
             plot_topk_curve(topk_curve, args.logdir, name=f"topk_curve_ep{ep}.png")
             if recalls_by_bucket:
@@ -169,19 +232,19 @@ def main(argv: List[str] | None = None) -> int:
     save_metrics_json({"best_R@64": best, **history}, args.logdir)
     # final: per-bucket box for diagonal scores
     try:
-        # re-eval to get sims and buckets for final plots
-        r64, topk_curve, recalls_by_bucket, sims_cpu, buckets = eval_recall(model, val_loader, device, topk=64)
+        # re-eval to get scores and buckets for final plots
+        r64, topk_curve, recalls_by_bucket, pos_scores, neg_scores, buckets = eval_recall(model, val_loader, device, topk=64)
         import collections
-        diag_scores = sims_cpu.diag().tolist()
         by_bucket = collections.defaultdict(list)
-        if buckets and len(buckets) == len(diag_scores):
-            for b, s in zip(buckets, diag_scores):
+        if buckets and len(buckets) == len(pos_scores):
+            for b, s in zip(buckets, pos_scores):
                 by_bucket[b].append(s)
         if by_bucket:
             plot_bucket_box(by_bucket, args.logdir, name="bucket_box.png")
         plot_topk_curve(topk_curve, args.logdir, name="topk_curve_final.png")
         if recalls_by_bucket:
             save_bucket_recalls(recalls_by_bucket, args.logdir, name="bucket_recalls_final.json")
+        plot_hist(pos_scores, neg_scores, args.logdir, name="score_hist_final.png")
     except Exception:
         pass
     writer.close()
