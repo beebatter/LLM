@@ -85,6 +85,7 @@ class BiCollate:
         d_ids_list: List[List[int]] = []
         d_masks: List[List[int]] = []
         labels: List[float] = []
+        buckets: List[str] = []
         for it in batch:
             q_s = _wrap_q(it.q)
             d_s = _wrap_d(it.d, it.features)
@@ -95,6 +96,9 @@ class BiCollate:
             q_masks.append([1] * len(q_ids))
             d_masks.append([1] * len(d_ids))
             labels.append(float(it.label))
+            # bucket key derived from features (same logic as prefix)
+            bucket_key = features_to_prefix(it.features or {}, PrefixBuckets())
+            buckets.append(bucket_key or "<UNK>")
 
         def pad(arrs: List[List[int]], pad_id: int) -> torch.Tensor:
             maxl = max(len(x) for x in arrs)
@@ -110,6 +114,7 @@ class BiCollate:
             "d_ids": pad(d_ids_list, self.pad_id),
             "d_mask": padm(d_masks),
             "labels": torch.tensor(labels, dtype=torch.float),
+            "bucket": buckets,
         }
 
 

@@ -8,9 +8,12 @@ from typing import List
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 
 from LLM.models.logic_transformers import TransformerEncoder, TransformerConfig
 from LLM.training.crossencoder_datasets import build_cross_dataloader
+from LLM.training.vis_utils import plot_curves, save_metrics_json, plot_hist
 
 
 class CrossHead(nn.Module):
@@ -42,6 +45,7 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--save", type=Path, default=Path("/home/ks/Training/models/cross_encoder_best.pt"))
+    ap.add_argument("--logdir", type=Path, default=Path("/home/ks/Training/logs/crossencoder"))
     args = ap.parse_args(argv)
 
     spm_vocab = Path(args.spm).with_suffix(".vocab")
@@ -65,6 +69,8 @@ def main(argv: List[str] | None = None) -> int:
 
     train_loader = build_cross_dataloader(args.train, spm_model=args.spm, batch_size=args.batch, shuffle=True, max_len=args.max_len)
     val_loader = build_cross_dataloader(args.val or args.train, spm_model=args.spm, batch_size=args.batch, shuffle=False, max_len=args.max_len)
+    writer = SummaryWriter(log_dir=str(args.logdir))
+    history = {"train_loss": [], "val_auc": []}
 
     best_auc = -1.0
     from sklearn.metrics import roc_auc_score
@@ -72,7 +78,8 @@ def main(argv: List[str] | None = None) -> int:
     for ep in range(1, args.epochs + 1):
         enc.train(); head.train()
         total, n = 0.0, 0
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"epoch {ep}/{args.epochs}", dynamic_ncols=True)
+        for batch in pbar:
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
             y = batch["labels"].to(device)
@@ -85,6 +92,8 @@ def main(argv: List[str] | None = None) -> int:
             opt.step()
             total += float(loss.item()) * ids.size(0)
             n += ids.size(0)
+            writer.add_scalar("train/loss_step", float(loss.item()), (ep-1)*len(train_loader)+pbar.n)
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(total/max(1,n)):.4f}")
         # eval
         enc.eval(); head.eval()
         ys, ps = [], []
@@ -104,7 +113,12 @@ def main(argv: List[str] | None = None) -> int:
             auc = float(roc_auc_score(ycat, pcat))
         except Exception:
             auc = 0.5
-        print(f"epoch {ep}: train_loss={total/max(1,n):.4f} val_auc={auc:.4f}")
+        avg_loss = total / max(1, n)
+        writer.add_scalar("train/loss_epoch", avg_loss, ep)
+        writer.add_scalar("val/auc", auc, ep)
+        history["train_loss"].append(avg_loss)
+        history["val_auc"].append(auc)
+        print(f"epoch {ep}: train_loss={avg_loss:.4f} val_auc={auc:.4f}")
         if auc > best_auc:
             best_auc = auc
             args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -115,6 +129,31 @@ def main(argv: List[str] | None = None) -> int:
                 "spm_model": args.spm,
             }, args.save)
             print(f"saved: {args.save}")
+
+    # end-of-training artifacts
+    plot_curves(history, args.logdir, prefix="crossencoder")
+    # optional: score histogram on a small slice of val
+    try:
+        import torch as _T
+        enc.eval(); head.eval()
+        pos_scores, neg_scores = [], []
+        with torch.no_grad():
+            for i, batch in enumerate(val_loader):
+                if i >= 20:  # small slice
+                    break
+                ids = batch["input_ids"].to(device)
+                mask = batch["attention_mask"].to(device)
+                y = batch["labels"].to(device)
+                h = enc(ids, mask)
+                logits = head(h, mask)
+                p = logits.sigmoid()
+                pos_scores += p[y > 0.5].cpu().tolist()
+                neg_scores += p[y <= 0.5].cpu().tolist()
+        plot_hist(pos_scores, neg_scores, args.logdir, name="score_hist.png")
+    except Exception:
+        pass
+    save_metrics_json({"best_auc": best_auc, **history}, args.logdir)
+    writer.close()
 
     return 0
 
