@@ -42,6 +42,11 @@ from typing import Dict, List, Tuple, Any
 SMALL_BATCH_THRESHOLD = 17
 SMALL_BATCH_MODEL = "gpt-4o-mini"
 
+# Optional local backend endpoint for scheme B (LLM rerank):
+# If set (e.g., http://127.0.0.1:8000/generate), LLMClient will POST {"prompt": "..."}
+# and expect a text field in response. This allows using vLLM/TGI/simple flask apps.
+LOCAL_LLM_ENDPOINT = os.getenv("LLM_LOCAL_ENDPOINT", "")
+
 
 # --------------------------- I/O ---------------------------
 
@@ -896,7 +901,8 @@ class LLMClient:
             if self.verbose:
                 print("[LLM] Model requires default temperature; overriding to 1.0")
         self._client = None
-        if not dry_run:
+        self._use_local = bool(LOCAL_LLM_ENDPOINT)
+        if not dry_run and not self._use_local:
             try:
                 # New-style SDK
                 from openai import OpenAI  # type: ignore
@@ -907,7 +913,7 @@ class LLMClient:
                     import openai  # type: ignore
                     self._client = openai
                 except Exception:
-                    raise RuntimeError("OpenAI SDK not available. Install `openai` and set OPENAI_API_KEY.")
+                    raise RuntimeError("OpenAI SDK not available and LLM_LOCAL_ENDPOINT not set.")
 
     def _chat(self, prompt: str) -> str:
         if self.dry_run:
@@ -930,6 +936,13 @@ class LLMClient:
             if self.verbose:
                 print(f"[LLM] request try {_+1}/{self.max_retries}...")
             try:
+                # Local HTTP endpoint: expects JSON {"prompt": str} -> {"text": str}
+                if self._use_local and LOCAL_LLM_ENDPOINT:
+                    import requests  # type: ignore
+                    r = requests.post(LOCAL_LLM_ENDPOINT, json={"prompt": prompt, "temperature": self.temperature, "max_new_tokens": 512})
+                    r.raise_for_status()
+                    obj = r.json()
+                    return obj.get("text") or obj.get("output") or obj.get("generated_text") or ""
                 # New-style SDK path
                 if hasattr(self._client, "chat"):
                     resp = self._client.chat.completions.create(
