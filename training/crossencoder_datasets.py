@@ -29,7 +29,7 @@ class CrossDataset(Dataset):
     def __init__(self, jsonl_paths: List[str]) -> None:
         self.items: List[QDPair] = []
 
-        def get_first(dct: Dict, keys: List[str]):
+        def _get_first(dct: Dict, keys: List[str]):
             for k in keys:
                 v = dct.get(k)
                 if v is not None:
@@ -43,11 +43,12 @@ class CrossDataset(Dataset):
                         j = json.loads(line)
                     except Exception:
                         continue
-                    q = get_first(j, ["conjecture_text", "conjecture_sig", "query", "q", "conjecture"])  # type: ignore[assignment]
-                    d = get_first(j, ["text", "doc", "d", "clause", "premise"])  # type: ignore[assignment]
+                    # Support both unified schema (text_a/text_b) and older fields
+                    q = _get_first(j, ["text_a", "conjecture_text", "conjecture_sig", "query", "q", "conjecture"])  # type: ignore[assignment]
+                    d = _get_first(j, ["text_b", "text", "doc", "d", "clause", "premise"])  # type: ignore[assignment]
                     if not q or not d:
                         continue
-                    features = get_first(j, ["features", "meta"]) or None
+                    features = _get_first(j, ["features", "meta"]) or None
                     lab = j.get("label")
                     try:
                         label = float(lab) if lab is not None else 0.0

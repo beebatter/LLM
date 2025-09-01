@@ -424,3 +424,61 @@ python3 process_iprover_v3.py serve --pipeline B_llm_rerank --select-top-k 1024 
 ---
 
 > 本白皮书对应的最小代码改动点均已列出，并提供了可执行的命令串。你可以先实现 **方案 A**（无需大模型服务，工程阻力小），并并行准备 **方案 B** 的 QLoRA 数据与脚本，两周内即可拉起对比评测。
+
+---
+
+## 已完成（方案 A 对齐进度与下一步）
+
+### 概览
+- 已完成：§3.1 Bi‑Encoder 训练、§3.2 索引构建（离线）、§3.3 Cross‑Encoder 训练与离线精排/评测。
+- 待完成：§3.2 在线接入（EA 串联）、§3.4 分数融合与调度，以及题内增量库与 LRU 缓存。
+
+### 3.1 Bi‑Encoder（SELECT）训练
+- Done
+  - 双塔 Transformer，采用 SupCon（按 problem 分组正例）对比学习；AMP + AdamW + warmup+cosine。
+  - 验证集按 problem 的 Recall@K（K=32/64）评测；R@64 ≈ 0.926（稳定）。
+  - 导出 best.pt 与 SentencePiece spm.model。
+- Partial
+  - 周期性难负挖掘尚未并入训练循环（当前仅 in‑batch 负与自然难例）。
+- Note
+  - SupCon 与 InfoNCE 为同类对比学习目标，可继续沿用或在此基础上加入难负。
+
+### 3.2 FAISS 建库与在线 SELECT
+- Done
+  - 已离线编码并构建索引（Flat/IP，向量 L2 归一化≈余弦）；产出 .npz/.faiss 与丰富 .meta.jsonl。
+  - select_service.py 可加载索引与模型进行 Top‑K；batch_select.py 已用于候选生成。
+- Partial
+  - 题内库增量 add 与 text→vector LRU 缓存未实现。
+  - EA 接入：process_iprover_v3.py 尚未在 scores_req 前串联 SELECT 调用。
+- 计划差异
+  - 白皮书建议 HNSW/IVF‑PQ 用于大库加速；当前为 Flat，后续可替换评估。
+
+### 3.3 Cross‑Encoder（Transformer）RERANK 训练
+- Done
+  - 数据：按题切分并做文档级排他，构建 train/val/test（无泄漏）。
+  - 训练：6 层 / hidden 512，BCEWithLogits；支持 init‑from 与 pos_weight；val AUC ≈ 0.988–0.989。
+  - 工具：rerank_with_cross_encoder.py 离线精排；eval_retrieval.py 计算 Hit/Recall/NDCG。
+- Partial
+  - 在线：batch_ranker.py 的 cross_encoder 后端与 EA 串联尚未落地。
+  - Pairwise/Listwise 目标暂未启用（当前主用二分类）。
+
+### 3.4 分数融合与调度
+- Todo
+  - 实现 S = λ1·S_cross + λ2·S_bi + λ3·S_heur 的网格搜索与在线融合。
+  - 调度：Top‑M(cross) + Oldest M1 + Lightest M2 + ε 随机；失败回退与日志保留。
+
+### 离线端到端评测（无泄漏 test，小样本）
+- 设置：Bi‑Encoder 检索 K=200 → Cross‑Encoder 精排；n_queries = 27。
+- 指标：
+  - Bi Hit@K：@64 ≈ 0.518，@200 ≈ 0.630；CE Hit@K：@64 ≈ 0.556，@200 ≈ 0.630。
+  - Bi Recall@K：@64 ≈ 0.0626，@200 ≈ 0.1778；CE Recall@K：@64 ≈ 0.1097，@200 ≈ 0.1778。
+  - CE 在小/中 K 明显提升 NDCG 与 Hit；K=200 与 Bi 持平（受候选上限影响）。
+- 诊断：
+  - 索引覆盖 ≈ 82%；单 query 平均正例 ≈ 180。
+  - K 限制的理论上限：@10≈0.056、@32≈0.178、@64≈0.356、@100≈0.556、@200≈1.0；当前结果符合预期。
+
+### 下一步（优先级）
+1) 在线打通：process_iprover_v3.py 在 scores_req 前调用 SELECT → 交给 batch_ranker.py(cross_encoder) → 回包；保留启发式回退与详尽日志。
+2) 召回与稳定性：将候选 K 提至 500/1000；扩大 test 题集；同步报告 reachable recall（扣除未覆盖正例）。
+3) 融合与调度：离线网格搜索 λ1/λ2/λ3（目标 NDCG@64/100）；在 EA 端实现融合与 Top‑M + Oldest/Lightest/ε 调度策略。
+4) 难负与索引：加入周期性难负挖掘微调 Bi；评估并切换 HNSW/IVF‑PQ；实现题内增量库与 text→vector LRU 缓存。
