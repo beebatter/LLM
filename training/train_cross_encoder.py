@@ -12,8 +12,13 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from LLM.models.logic_transformers import TransformerEncoder, TransformerConfig
-from LLM.training.crossencoder_datasets import build_cross_dataloader
+from LLM.training.crossencoder_datasets import build_cross_dataloader, build_cross_grouped_dataloader
 from LLM.training.vis_utils import plot_curves, save_metrics_json, plot_hist
+
+try:
+    import sentencepiece as spm  # type: ignore
+except Exception:
+    spm = None
 
 
 class CrossHead(nn.Module):
@@ -44,63 +49,59 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=256)
-    ap.add_argument("--pos-weight", type=float, default=1.0, help="Positive class weight for BCE; 1.0 means unweighted")
-    ap.add_argument("--init-from", type=Path, default=None, help="Path to a previous CE checkpoint to continue training from")
     ap.add_argument("--save", type=Path, default=Path("/home/ks/Training/models/cross_encoder_best.pt"))
     ap.add_argument("--logdir", type=Path, default=Path("/home/ks/Training/logs/crossencoder"))
+    # loss & grouping options
+    ap.add_argument("--loss", type=str, choices=["bce", "listwise"], default="bce")
+    ap.add_argument("--group-size", type=int, default=16, help="Max candidates per query/group in listwise mode")
+    ap.add_argument("--groups-per-batch", type=int, default=4, help="Groups per batch in listwise mode")
     args = ap.parse_args(argv)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Build or resume model
-    if args.init_from is not None:
-        ckpt = torch.load(args.init_from, map_location="cpu")
-        cfg = TransformerConfig(**ckpt["config"])  # type: ignore
-        # Ensure we use the same SPM model as in the checkpoint to avoid vocab mismatch
+    # robust vocab size from SPM model or .vocab fallback
+    vocab_size = None
+    if spm is not None:
         try:
-            ckpt_spm = ckpt.get("spm_model")
-            if ckpt_spm:
-                args.spm = ckpt_spm  # type: ignore[assignment]
+            spp = spm.SentencePieceProcessor()
+            spp.load(str(args.spm))
+            vocab_size = int(spp.get_piece_size())
         except Exception:
-            pass
-        enc = TransformerEncoder(cfg).to(device)
-        head = CrossHead(cfg.d_model).to(device)
-        try:
-            enc.load_state_dict(ckpt["encoder_state"])  # type: ignore[arg-type]
-            head.load_state_dict(ckpt["head_state"])  # type: ignore[arg-type]
-            print(f"resumed from: {args.init_from}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load checkpoint {args.init_from}: {e}")
-    else:
+            vocab_size = None
+    if vocab_size is None:
         spm_vocab = Path(args.spm).with_suffix(".vocab")
         with open(spm_vocab, "r", encoding="utf-8") as f:
             vocab_size = sum(1 for _ in f)
-        cfg = TransformerConfig(
-            vocab_size=vocab_size,
-            d_model=args.d_model,
-            n_heads=args.heads,
-            n_layers=args.layers,
-            pad_id=0,
-            max_len=args.max_len,
-        )
-        enc = TransformerEncoder(cfg).to(device)
-        head = CrossHead(cfg.d_model).to(device)
+
+    cfg = TransformerConfig(
+        vocab_size=vocab_size,
+        d_model=args.d_model,
+        n_heads=args.heads,
+        n_layers=args.layers,
+        pad_id=0,
+        max_len=args.max_len,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    enc = TransformerEncoder(cfg).to(device)
+    head = CrossHead(cfg.d_model).to(device)
     params = list(enc.parameters()) + list(head.parameters())
     opt = AdamW(params, lr=args.lr)
-    # BCE with optional positive weighting
-    if args.pos_weight and abs(args.pos_weight - 1.0) > 1e-9:
-        pw = torch.tensor([float(args.pos_weight)], dtype=torch.float32, device=device)
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
-    else:
-        loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss()
 
-    train_loader = build_cross_dataloader(args.train, spm_model=args.spm, batch_size=args.batch, shuffle=True, max_len=args.max_len)
+    if args.loss == "listwise":
+        train_loader = build_cross_grouped_dataloader(
+            args.train, spm_model=args.spm, group_size=args.group_size, groups_per_batch=args.groups_per_batch, max_len=args.max_len, shuffle=True
+        )
+    else:
+        train_loader = build_cross_dataloader(args.train, spm_model=args.spm, batch_size=args.batch, shuffle=True, max_len=args.max_len)
     val_loader = build_cross_dataloader(args.val or args.train, spm_model=args.spm, batch_size=args.batch, shuffle=False, max_len=args.max_len)
     writer = SummaryWriter(log_dir=str(args.logdir))
     history = {"train_loss": [], "val_auc": []}
 
     best_auc = -1.0
     from sklearn.metrics import roc_auc_score
+
+    if len(train_loader) == 0:
+        print("Empty train loader: check input paths and schema (need query/text fields).", flush=True)
+        return 1
 
     for ep in range(1, args.epochs + 1):
         enc.train(); head.train()
@@ -113,12 +114,38 @@ def main(argv: List[str] | None = None) -> int:
             opt.zero_grad(set_to_none=True)
             h = enc(ids, mask)
             logits = head(h, mask)
-            loss = loss_fn(logits, y)
+            if args.loss == "listwise":
+                # group-wise softmax CE over positives
+                group_ids = batch.get("group_ids")
+                if group_ids is None:
+                    # fallback to BCE if grouping missing
+                    loss = loss_fn(logits, y)
+                    eff_bs = ids.size(0)
+                else:
+                    gid = group_ids.to(device)
+                    loss_sum = 0.0
+                    groups = gid.unique().tolist()
+                    eff_groups = 0
+                    for g in groups:
+                        m = (gid == g)
+                        lg = logits[m]
+                        yg = y[m]
+                        if (yg > 0.5).sum() == 0:
+                            continue  # skip groups with no positives
+                        logp = lg - torch.logsumexp(lg, dim=0)
+                        loss_g = -logp[yg > 0.5].mean()
+                        loss_sum = loss_sum + loss_g
+                        eff_groups += 1
+                    loss = loss_sum / max(1, eff_groups)
+                    eff_bs = eff_groups
+            else:
+                loss = loss_fn(logits, y)
+                eff_bs = ids.size(0)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
-            total += float(loss.item()) * ids.size(0)
-            n += ids.size(0)
+            total += float(loss.item()) * eff_bs
+            n += eff_bs
             writer.add_scalar("train/loss_step", float(loss.item()), (ep-1)*len(train_loader)+pbar.n)
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(total/max(1,n)):.4f}")
         # eval
@@ -134,12 +161,16 @@ def main(argv: List[str] | None = None) -> int:
                 ys.append(y.cpu())
                 ps.append(logits.sigmoid().cpu())
         import numpy as np
-        ycat = torch.cat(ys).numpy()
-        pcat = torch.cat(ps).numpy()
-        try:
-            auc = float(roc_auc_score(ycat, pcat))
-        except Exception:
-            auc = 0.5
+        if len(ys) == 0:
+            print("Warning: empty val loader; skipping AUC this epoch.")
+            auc = float('nan')
+        else:
+            ycat = torch.cat(ys).numpy()
+            pcat = torch.cat(ps).numpy()
+            try:
+                auc = float(roc_auc_score(ycat, pcat))
+            except Exception:
+                auc = 0.5
         avg_loss = total / max(1, n)
         writer.add_scalar("train/loss_epoch", avg_loss, ep)
         writer.add_scalar("val/auc", auc, ep)
