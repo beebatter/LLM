@@ -424,3 +424,64 @@ python3 process_iprover_v3.py serve --pipeline B_llm_rerank --select-top-k 1024 
 ---
 
 > 本白皮书对应的最小代码改动点均已列出，并提供了可执行的命令串。你可以先实现 **方案 A**（无需大模型服务，工程阻力小），并并行准备 **方案 B** 的 QLoRA 数据与脚本，两周内即可拉起对比评测。
+
+
+LLM 最终方案：
+
+要点评审与微调
+
+A 路线（打分头一次出 K 分）
+优点：时延低、吞吐高、训练目标可直接对齐教师分布（Listwise CE/KL）。
+风险：标记位定位与长度控制。建议用 <CAND_START>/<CAND_END> 标记候选边界，仅取 <CAND_START> 位置隐向量（或区间平均）喂线性头，K 先用 32/48，再观察显存与收敛推到 64。
+训练目标：组内 softmax 后做 CE/KL，温度 τ 在 0.5–1.5 搜索；同时保留 z-score + 偏置 b 的后标定。
+B 路线（逐候选 PLL/PMI）
+优点：零改模、口径稳定、可直接上线或充当强教师；对 32B 很合适。
+风险：慢 K 倍；注意“逐候选独立前向”（避免候选互看）；长度偏置用“平均 LL”，并做 PMI 校正（λ∈[0.5,1.0]）。
+数据与难负
+你的“listwise 组内候选 + 难负占比≥60% + 每 epoch 打乱顺序”是对的；注意 target_scores 要随顺序打乱一起重排。
+教师融合：p* = w_bi p_bi + w_ce p_ce + w_llm32 p_llm32，分早段（Hit@10）与中深段（NDCG@32）分别拟合权重，统一口径很关键。
+special tokens 与对齐
+一定添加 <CAND_START>/<CAND_END> 和结构前缀为 special tokens；resize_token_embeddings 并设置 pad/eos 对齐；use_cache=False + gradient_checkpointing 以节省显存。
+指标与标定
+指标：NDCG@{10,32}、Hit@{10,32}、与教师分布的 KL/MAE/Pearson。
+标定：组内 z-score → (τ,b) 在 dev 上拟合，写 calib.yaml，训练/评测/上线统一使用。
+逐步落地（建议执行顺序）
+
+数据成形（两模型通用）
+生成 listwise 训练样本（K=48 起步）：conjecture + candidates[i].text/tags + target_scores[i]（来自 p* 融合或 CE 单源起步）。
+提升难负占比（≥60%），并保证每个 query 至少 1 个正例。
+规范化文本与结构标记（你已有），并插入 <CAND_START>/<CAND_END>；记录每个候选的 <CAND_START> 索引供打分头提取。
+DeepSeek‑Prover‑V2‑7B（主力在线打分器）
+训练（LoRA + 打分头）
+LoRA: r=16, α=32, dropout=0.05，target_modules=[q,k,v,o]；bf16；gradient_checkpointing=True；flash‑attn 可开则开。
+优化：AdamW lr=1e-4 wd=0.01，cosine + warmup_ratio=0.03；epochs=2–3；batch=1 grad_accum=16（等效 bs=16）；max_len=1024。
+损失：组内 softmax(s/τ) 与 p* 做 CE/KL，τ∈{0.7,1.0,1.3} 网格。
+标定与评测
+dev 上拟合 z-score/τ/b，报告 NDCG/Hit 与 KL/MAE/Pearson。
+上线
+批量输入每个 query 的 K 候选，一次前向产分；开启 prefix‑cache（只变 <D> 段）降时延。
+融合 Bi（w_bi≈0.2, w_llm≈0.8），先在灰度流量验证。
+Goedel‑Prover‑V2‑32B（高精教师 & 离线重排）
+路线 A：QLoRA + 打分头（1–2 epoch）
+量化：4‑bit nf4 + double_quant，compute_dtype=bf16；LoRA: r=16, α=32, dropout=0.05；lr=5e-5。
+目标：对齐 p*，作为“高质量重排器/教师”，离线重排 CE Top‑M（如 256）并缓存。
+路线 B：PMI（零改造）
+逐候选前向，score=avg_logP(c|q)−λ·avg_logP(c)；λ 网格；组内 z‑score + (τ,b) 标定。
+用其分布替换/融入 p*，给 7B 蒸馏。
+蒸馏与协同
+用 32B‑PMI 或 32B‑Head 的分布，联合 CE/Bi 形成 p*；蒸馏到 7B‑Head（CE→Bi 的经验同样适用）。
+线上：7B‑Head 为主，Bi 融合；离线：32B 重排/复核低置信度样本；统一 calib.yaml。
+风险与兜底
+长度/显存：K×长度接近上限时，优先降 K→48，再裁长度（例如 896）；必要时按候选长短分批。
+标记位定位：必须在 tokenized 序列中准确获取每个 <CAND_START> 的位置，错位会“学不动”。
+候选互看：仅限 A 路线；B 路线坚持逐候选独立前向。
+数据泄漏：train/dev/test 按 query 去重，防止跨集合泄漏。
+可直接执行的小清单
+
+先跑 7B‑Head（K=48，τ=1.0，2 epoch）+ dev 标定，做线上 A/B 与 CE 对比。
+并行跑 32B‑PMI 作为教师/离线重排，合成 p* 蒸馏回 7B‑Head。
+收敛后再把 K 提到 64，更新 calib 与融合权重。
+需要的话，我可以：
+
+写最小化训练脚本（peft/transformers）实现「打分头 + LoRA + listwise CE/KL」和「PMI scorer + 标定」；
+衔接一个 Ranker 封装，直接替换你当前重排调用，输出口径与 CE 一致。

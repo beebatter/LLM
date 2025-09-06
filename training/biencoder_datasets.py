@@ -86,6 +86,10 @@ class BiCollate:
         d_masks: List[List[int]] = []
         labels: List[float] = []
         buckets: List[str] = []
+        # build query-group ids within batch
+        gid_map: Dict[str, int] = {}
+        next_gid = 0
+        q_group_ids: List[int] = []
         for it in batch:
             q_s = _wrap_q(it.q)
             d_s = _wrap_d(it.d, it.features)
@@ -99,6 +103,12 @@ class BiCollate:
             # bucket key derived from features (same logic as prefix)
             bucket_key = features_to_prefix(it.features or {}, PrefixBuckets())
             buckets.append(bucket_key or "<UNK>")
+            # group key: normalized raw query text
+            gkey = normalize_text(it.q)
+            if gkey not in gid_map:
+                gid_map[gkey] = next_gid
+                next_gid += 1
+            q_group_ids.append(gid_map[gkey])
 
         def pad(arrs: List[List[int]], pad_id: int) -> torch.Tensor:
             maxl = max(len(x) for x in arrs)
@@ -115,6 +125,7 @@ class BiCollate:
             "d_mask": padm(d_masks),
             "labels": torch.tensor(labels, dtype=torch.float),
             "bucket": buckets,
+            "q_group_ids": torch.tensor(q_group_ids, dtype=torch.long),
         }
 
 

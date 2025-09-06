@@ -35,6 +35,34 @@ class InfoNCE(nn.Module):
         return nn.functional.cross_entropy(logits, labels)
 
 
+class SupConLoss(nn.Module):
+    """Supervised contrastive loss for sentence embeddings.
+    Treat samples sharing the same query-group id as positives for each anchor; others are negatives.
+    """
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.t = temperature
+
+    def forward(self, q: torch.Tensor, d: torch.Tensor, q_group_ids: torch.Tensor) -> torch.Tensor:
+        # embeddings [B,D], ids [B]
+        zq = nn.functional.normalize(q, dim=1)
+        zd = nn.functional.normalize(d, dim=1)
+        sim = (zq @ zd.t()) / self.t  # [B,B]
+        B = sim.size(0)
+        # mask positives: same group id
+        gid = q_group_ids.view(-1, 1)
+        pos_mask = (gid == gid.t()).float()  # [B,B]
+        # remove self if想使用纯跨样本，这里保留对角，因为 (q_i,d_i) 也是正
+        # 对比损失：对每一行，logsumexp over all, log-sum over positives
+        log_denom = torch.logsumexp(sim, dim=1)  # [B]
+        # avoid zero positives: clamp
+        pos_logits = sim * pos_mask + (-1e9) * (1.0 - pos_mask)
+        # sum exp over positives
+        log_pos_sum = torch.logsumexp(pos_logits, dim=1)  # [B]
+        loss = -(log_pos_sum - log_denom).mean()
+        return loss
+
+
 @torch.no_grad()
 def eval_recall(model: BiEncoder, loader, device: torch.device, topk: int = 64, neg_per_query: int = 16, max_neg_samples: int = 50000):
     model.eval()
@@ -140,6 +168,8 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--save", type=Path, default=Path("/home/ks/Training/models/biencoder_best.pt"))
     ap.add_argument("--limit", type=int, default=0, help="Limit number of training examples (for quick sanity runs)")
     ap.add_argument("--logdir", type=Path, default=Path("/home/ks/Training/logs/biencoder"))
+    ap.add_argument("--loss", type=str, choices=["infonce", "supcon"], default="infonce")
+    ap.add_argument("--temperature", type=float, default=0.07)
     args = ap.parse_args(argv)
 
     # vocab size from spm model or .vocab fallback
@@ -171,7 +201,10 @@ def main(argv: List[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = BiEncoder(cfg).to(device)
     opt = AdamW(model.parameters(), lr=args.lr)
-    loss_fn = InfoNCE(temperature=0.07)
+    if args.loss == "supcon":
+        loss_fn = SupConLoss(temperature=args.temperature)
+    else:
+        loss_fn = InfoNCE(temperature=args.temperature)
     writer = SummaryWriter(log_dir=str(args.logdir))
 
     limit = args.limit if args.limit and args.limit > 0 else None
@@ -193,7 +226,15 @@ def main(argv: List[str] | None = None) -> int:
             opt.zero_grad(set_to_none=True)
             q = model.encode(q_ids, q_mask, which="q")
             d = model.encode(d_ids, d_mask, which="d")
-            loss = loss_fn(q, d)
+            if args.loss == "supcon":
+                qg = batch.get("q_group_ids")
+                if qg is None:
+                    # fallback to InfoNCE if group ids missing
+                    loss = InfoNCE(args.temperature)(q, d)
+                else:
+                    loss = loss_fn(q, d, qg.to(device))
+            else:
+                loss = loss_fn(q, d)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
