@@ -42,6 +42,11 @@ from typing import Dict, List, Tuple, Any
 SMALL_BATCH_THRESHOLD = 17
 SMALL_BATCH_MODEL = "gpt-4o-mini"
 
+# Optional local backend endpoint for scheme B (LLM rerank):
+# If set (e.g., http://127.0.0.1:8000/generate), LLMClient will POST {"prompt": "..."}
+# and expect a text field in response. This allows using vLLM/TGI/simple flask apps.
+LOCAL_LLM_ENDPOINT = os.getenv("LLM_LOCAL_ENDPOINT", "")
+
 
 # --------------------------- I/O ---------------------------
 
@@ -896,7 +901,8 @@ class LLMClient:
             if self.verbose:
                 print("[LLM] Model requires default temperature; overriding to 1.0")
         self._client = None
-        if not dry_run:
+        self._use_local = bool(LOCAL_LLM_ENDPOINT)
+        if not dry_run and not self._use_local:
             try:
                 # New-style SDK
                 from openai import OpenAI  # type: ignore
@@ -907,7 +913,7 @@ class LLMClient:
                     import openai  # type: ignore
                     self._client = openai
                 except Exception:
-                    raise RuntimeError("OpenAI SDK not available. Install `openai` and set OPENAI_API_KEY.")
+                    raise RuntimeError("OpenAI SDK not available and LLM_LOCAL_ENDPOINT not set.")
 
     def _chat(self, prompt: str) -> str:
         if self.dry_run:
@@ -930,6 +936,13 @@ class LLMClient:
             if self.verbose:
                 print(f"[LLM] request try {_+1}/{self.max_retries}...")
             try:
+                # Local HTTP endpoint: expects JSON {"prompt": str} -> {"text": str}
+                if self._use_local and LOCAL_LLM_ENDPOINT:
+                    import requests  # type: ignore
+                    r = requests.post(LOCAL_LLM_ENDPOINT, json={"prompt": prompt, "temperature": self.temperature, "max_new_tokens": 512})
+                    r.raise_for_status()
+                    obj = r.json()
+                    return obj.get("text") or obj.get("output") or obj.get("generated_text") or ""
                 # New-style SDK path
                 if hasattr(self._client, "chat"):
                     resp = self._client.chat.completions.create(
@@ -1000,6 +1013,77 @@ def normalize_and_align(chunks_json: List[Dict[str, Any]], anchor_ids: List[int]
         return out
     return {cid: (sc - vmin) / (vmax - vmin) for cid, sc in agg.items()}
 
+# ---------------------- Fusion helpers ----------------------
+
+def _normalize_mapping_01(m: Dict[int, float]) -> Dict[int, float]:
+    if not m:
+        return {}
+    vals = list(m.values())
+    vmin, vmax = min(vals), max(vals)
+    if abs(vmax - vmin) < 1e-12:
+        # flat -> stable jitter by id
+        out: Dict[int, float] = {}
+        for cid in sorted(m.keys()):
+            h = int(hashlib.sha256(str(cid).encode("utf-8")).hexdigest(), 16)
+            out[cid] = (h % 1009) / 1009.0
+        return out
+    return {int(k): (float(v) - vmin) / (vmax - vmin) for k, v in m.items()}
+
+def _scores_from_field(cands: List[Dict[str, Any]], field: str, fallbacks: List[str]) -> Dict[int, float]:
+    keys = [field] if field else []
+    for fb in fallbacks:
+        if fb not in keys:
+            keys.append(fb)
+    out: Dict[int, float] = {}
+    for c in cands or []:
+        cid = c.get("id")
+        if cid is None:
+            continue
+        for k in keys:
+            if k and (k in c):
+                try:
+                    out[int(cid)] = float(c.get(k))
+                    break
+                except Exception:
+                    continue
+    return out
+
+def _load_scores_file(path: str) -> Dict[int, float]:
+    """Load a mapping id->score from a json file.
+    Accepts shapes:
+      - {"scores":[{"id":..,"score":..}, ...]}
+      - {"123": 0.8, "124": {"score": 0.2}}
+      - [{"id":..,"score":..}, ...]
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    data = obj
+    if isinstance(obj, dict) and "scores" in obj:
+        data = obj["scores"]
+    out: Dict[int, float] = {}
+    if isinstance(data, list):
+        for x in data:
+            try:
+                if isinstance(x, dict) and ("id" in x) and ("score" in x):
+                    out[int(x["id"])] = float(x["score"])
+            except Exception:
+                continue
+        return out
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                if isinstance(v, dict) and ("score" in v):
+                    out[int(k)] = float(v.get("score", 0.0))
+                else:
+                    out[int(k)] = float(v)
+            except Exception:
+                continue
+        return out
+    return {}
+
 # --------------------------- Main ---------------------------
 
 def main():
@@ -1019,6 +1103,14 @@ def main():
     # save-prompts hard-wired on by default; keep the flag for compatibility but it is ignored
     ap.add_argument("--save-prompts", action="store_true", help="(ignored; always on) dump prompts and raw responses to files")
     ap.add_argument("--progress", action="store_true", help="print live progress while LLM is running")
+    # Fusion options
+    ap.add_argument("--lambda-cross", type=float, default=1.0, help="weight for cross-encoder score (this pipeline)")
+    ap.add_argument("--lambda-bi", type=float, default=0.0, help="weight for bi-encoder score")
+    ap.add_argument("--lambda-heur", type=float, default=0.0, help="weight for heuristic score")
+    ap.add_argument("--bi-scores", type=str, default=None, help="optional JSON path with id->score for bi-encoder")
+    ap.add_argument("--heur-scores", type=str, default=None, help="optional JSON path with id->score for heuristic")
+    ap.add_argument("--bi-score-field", type=str, default="bi_score", help="if file not given, read candidate field for bi score")
+    ap.add_argument("--heur-score-field", type=str, default="heur_score", help="if file not given, read candidate field for heuristic score")
     args = ap.parse_args()
 
     ds = load_dataset(args.input)
@@ -1193,8 +1285,44 @@ def main():
     if vals_dbg:
         print(f"[CAL] global min={min(vals_dbg):.3f} max={max(vals_dbg):.3f} mean={sum(vals_dbg)/len(vals_dbg):.3f}")
 
+    # 分数融合（S = λ1·S_cross + λ2·S_bi + λ3·S_heur），各自先归一化到 [0,1]
+    lam_cross = max(0.0, float(args.lambda_cross))
+    lam_bi = max(0.0, float(args.lambda_bi))
+    lam_heur = max(0.0, float(args.lambda_heur))
+    use_fusion = (lam_bi > 0.0) or (lam_heur > 0.0)
+
+    fused_scores: Dict[int, float] = dict(final_scores)
+    if use_fusion:
+        # cross component
+        S_cross = _normalize_mapping_01(final_scores)
+        # bi component
+        if args.bi_scores:
+            raw_bi = _load_scores_file(args.bi_scores)
+        else:
+            raw_bi = _scores_from_field(cands, args.bi_score_field, fallbacks=["S_bi", "bi", "select_score", "select_sim", "select_sim_norm"])
+        S_bi = _normalize_mapping_01(raw_bi)
+        # heuristic component
+        if args.heur_scores:
+            raw_h = _load_scores_file(args.heur_scores)
+        else:
+            raw_h = _scores_from_field(cands, args.heur_score_field, fallbacks=["S_heur", "heur", "ea_score"]) 
+        S_heur = _normalize_mapping_01(raw_h)
+
+        # union of ids present in any component
+        ids_union = set(S_cross.keys()) | set(S_bi.keys()) | set(S_heur.keys())
+        fused_scores = {}
+        denom = max(1e-12, lam_cross + lam_bi + lam_heur)
+        for cid in ids_union:
+            sc = lam_cross * S_cross.get(cid, 0.0) + lam_bi * S_bi.get(cid, 0.0) + lam_heur * S_heur.get(cid, 0.0)
+            fused_scores[int(cid)] = sc / denom
+        # Re‑normalize fused to [0,1] for readability
+        fused_scores = _normalize_mapping_01(fused_scores)
+        if not fused_scores:
+            # fallback to cross-only if fusion produced nothing
+            fused_scores = dict(final_scores)
+
     # 输出（按分数降序）
-    ranking_items = sorted(((int(cid), float(sc)) for cid, sc in final_scores.items()), key=lambda kv: kv[1], reverse=True)
+    ranking_items = sorted(((int(cid), float(sc)) for cid, sc in fused_scores.items()), key=lambda kv: kv[1], reverse=True)
     result = {
         "meta": {
             "model": args.model,
@@ -1211,10 +1339,19 @@ def main():
                 "anchors": 0,
                 "chunks": len(chunks),
             },
+            "fusion": {
+                "lambda_cross": lam_cross,
+                "lambda_bi": lam_bi,
+                "lambda_heur": lam_heur,
+                "bi_scores_file": args.bi_scores,
+                "heur_scores_file": args.heur_scores,
+                "bi_score_field": args.bi_score_field,
+                "heur_score_field": args.heur_score_field,
+            },
         },
         "conjecture_id": conj.get("id"),
         "anchor_ids": [],  # simplified
-        "scores": [{"id": int(cid), "score": float(score)} for cid, score in ranking_items],
+    "scores": [{"id": int(cid), "score": float(score)} for cid, score in ranking_items],
     }
     save_json(result, args.out)
     topk = min(20, len(ranking_items))
