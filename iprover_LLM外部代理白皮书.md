@@ -1,3 +1,129 @@
+# iProver LLM 外部代理白皮书（实验进展与训练改进计划）
+
+## 背景与目标
+
+- 目标：让 LLM 作为 iProver 的外部重排器，对“猜想 + K 条候选子句”输出候选级分布，用于给定选择与子句排序，提升证明效率。
+- 两条路线：
+  - LLM 精排（listwise 学习，输出分布/分数）。
+  - 传统 Transformer（Bi-Encoder 召回 + Cross-Encoder 精排），作为教师与融合成员。
+- 输出协议：
+  - 在线期望直接得到每候选的打分分布（建议直算 softmax 分布或候选打分头），避免依赖 JSON 解析的脆弱性。
+
+## 当前实验设置（数据/模型/脚本）
+
+数据
+- listwise 教师融合数据：
+  - 训练：`/root/autodl-tmp/Training/datasets/listwise/train.listwise.teacher.jsonl`
+  - 验证：`/root/autodl-tmp/Training/datasets/listwise/val.listwise.teacher.jsonl`
+- 生成：`scripts/build_listwise.sh`（支持 Cross+Bi 教师融合：softmax(λ_ce·s_ce + λ_bi·s_bi; τ)）。
+
+模型与训练
+- 7B：`DeepSeek-Prover-V2-7B`（本地），LoRA，2 epoch，bf16 / 8bit / none；max_len≈2048。
+- 32B：`Goedel-Prover-V2-32B`（本地），QLoRA（4bit），2 epoch；max_len≈1024。
+- 训练脚本：`training/train_llm_listwise_sft.py`
+  - 关键稳健化：pad→eos、resize_token_embeddings、labels 忽略 pad/越界、use_cache=False、梯度检查点。
+  - 量化开关：`--quant {4bit,8bit,none}`。
+
+评测与重排
+- 列表一致性评测（直算 softmax）：`training/eval_llm_listwise.py --mode direct`（候选独立前向，逐 token 对数似然求和 → softmax）。
+- 检索评测（Bi/CE/LLM/Fusion）：
+  - 生成 CE/LLM 重排：`select/rerank_with_cross_encoder.py`、`select/rerank_with_llm.py`。
+  - 评测融合：`select/eval_retrieval.py`（支持 λ 网格）。
+
+## 结果摘要（离线）
+
+列表一致性（与教师目标的对齐；验证子集 n≈102）
+- 7B：len_match=1.0，MAE≈0.030，MSE≈0.0137，Pearson≈0.05。
+- 32B：len_match=1.0，MAE≈0.030，MSE≈0.0137，Pearson≈0.27。
+
+检索指标（把 LLM 当重排器；同一 queries/labels/meta，n≈27）
+- Bi 与 CE：CE 普遍优于 Bi；
+- LLM 7B：早段 Hit@10 ≈ CE，整体相近；
+- LLM 32B：早段略弱于 CE，中深段接近 Bi；
+- Bi+CE 融合 λ 网格（固定 λ_ce=1.0）：
+  - 最优 Hit@10：λ_bi=0.1（Hit@10≈0.333，NDCG@32≈0.242）。
+  - 最优 NDCG@32：λ_bi=0.2（NDCG@32≈0.249，Hit@10≈0.259）。
+
+简短结论
+- 现状下，LLM 重排并未稳定优于 CE/Bi（7B 早段≈CE，32B 早段更弱；listwise 直评 7B 相关性≈0，32B≈0.27）。
+- 更像“微调尚未到位/评测不完全对齐”，非模型无能。
+
+## 诊断与成因
+
+- 目标-指标不匹配：训练拟合教师软分布（listwise CE+Bi），评测偏向 Hit@K/NDCG；建议加排序目标（ListMLE/Pairwise）或蒸馏 CE logits（KL）。
+- 长度偏置：直评按“对数似然总和”，长候选吃亏；应使用“平均每 token 对数似然”或加长度惩罚。
+- 上下文截断：为避 OOM 降低 input_max/target_max，损失关键信息；H800 可开 flash-attn/TF32，尝试 2048/256。
+- 量化差异：7B 训练 bf16、评测 4bit 会拉低表现；建议 7B 用 8bit/none 做对照。
+- 训练信号偏“模板模仿”：正例均分、缺少“正例内部强弱”与候选级信号；损失落在 token 层而非候选层。
+- 样本量与超参：仅 2 epoch；LoRA r/α/dropout/调度需继续调优；难负占比与数据增强可强化。
+- 提示一致性：需再核验训练/评测 prompt 完全一致（分隔符/字段/顺序）。
+
+## 训练改进实现计划（适配本仓库）
+
+一、评测口径校准（不改模型即可增益）
+- 直评改“平均 LL”：`s_mean = (1/|c|)Σ log p(x_t|prompt)`；新增选项：`--score-type {sum-ll, mean-ll}`。
+- 逐候选独立前向：避免 K 候选同上下文引入注意力泄漏；保留现有 `--mode direct`，确保每候选单独前向。
+- 组内归一：对窗口 {s_i} 做 z-score 或减中位数/除 MAD（新增 `--zscore`）。
+- 温度/偏置标定：dev 上拟合 p̂=softmax((s−b)/τ)，加入 `--calib-tau/--calib-bias`。
+- 可选 PMI：`s_PMI = logP(c|conj) − λ·logP(c)`（λ∈[0.5,1.0]，需无条件提示的基线前向）。
+
+二、候选级目标学习（替代“生成 JSON 的 SFT”）
+- 模型端增加“候选打分头”：为每候选包裹 `<CAND_START>…<CAND_END>`，取 `<CAND_START>` 隐状态 h_i，经线性头得 s_i；p̂=softmax(s)。
+- 损失：对齐教师软分布 p* 的 CE/KL；可混入少量 pairwise（Bradley–Terry/margin）作正则。
+- 实现：在 `training/train_llm_listwise_sft.py` 增加 `--score-head` 模式或新脚本 `train_llm_listwise_scorehead.py`；LoRA 仅接上层与打分头，降低显存与不稳。
+
+三、教师分布增强（调尖正例内部形状）
+- 使用 dev 网格搜 `(pos_mass m, temperature τ, blend α)`（脚本 `target_dist_tuner.py`），生成更“尖锐”的 target_scores：
+  - pos_weights = (1−α)·uniform + α·softmax(teacher/τ)；
+  - 仅作用于正例子集，负例均分剩余质量；整体加 ε 平滑再归一。
+- 管道：在 `scripts/build_listwise.sh` 中增加读取最佳 YAML 并重写 target_scores（不改样本本体）。
+
+四、训练细节抛光（当前配方微调）
+- 学习率：7B LoRA 建议 5e-5～1e-4；32B QLoRA 5e-5；warmup_ratio≈0.03，cosine 调度，epoch 2–3。
+- 候选随机化：每 epoch 重排候选顺序，目标同步重排。
+- 难负注入：提高 `NEG_given_nonproof` 占比（如 0.6），增强早段命中能力。
+- 蒸馏 logits：直接蒸馏 CE 的 K 维原始分，τ=1–2，比离散软分更细腻。
+- 性能：H800 开启 flash-attn/TF32，use_cache=False，梯度检查点；7B 用 8bit/none 评测对照。
+
+五、融合与评测（与 Bi/CE 协同）
+- 融合：S = λ_ce·S_ce + λ_bi·S_bi + λ_llm·S_llm； per-query 归一策略（min-max/z-score/RRF）可选。
+- 评测：Hit@{10,32,64}、NDCG@{10,32,64}、Recall@K；dev 小网格选 λ。
+
+六、两天落地排期
+- Day 1：
+  - 评测口径：`--score-type mean-ll`、`--zscore`、`--calib-*`；可选 PMI；H800 上提至 input_max=2048/target_max=256 复测。
+  - 目标分布：运行 `target_dist_tuner.py` 搜 m,τ,α，重写 `train/val.listwise.teacher.jsonl` 的 target_scores。
+- Day 2：
+  - 7B：LoRA lr=1e-4，epoch=2–3，listwise CE/KL（或 score-head）；随机候选；难负 0.6；8bit/none 评测对照。
+  - 32B：QLoRA lr=5e-5，epoch=2，同上；
+  - 评测：listwise 一致性（mean‑LL 口径）、Bi top‑200 重排（Hit/NDCG）、三方融合小网格；固化最佳 λ。
+
+## 操作指引（可选参考）
+
+- 生成 listwise（含教师融合）：`bash scripts/build_listwise.sh`（按需设置 CROSS/BI/SPM 路径、τ、λ_bi）。
+- 训练 7B（单卡）示例：
+  - `CUDA_VISIBLE_DEVICES=0 python training/train_llm_listwise_sft.py --model /root/autodl-tmp/models/DeepSeek-Prover-V2-7B --train .../train.listwise.teacher.jsonl --val .../val.listwise.teacher.jsonl --out .../deepseek7b-listwise-lora --batch 2 --grad-accum 8 --epochs 2 --lr 1e-4 --max-len 2048 --bf16 --quant 8bit`
+- 训练 32B（单卡）示例：
+  - `CUDA_VISIBLE_DEVICES=1 python training/train_llm_listwise_sft.py --model /root/autodl-tmp/models/Goedel-Prover-V2-32B --train ... --val ... --out .../goedel32b-listwise-lora --batch 1 --grad-accum 16 --epochs 2 --lr 8e-5 --max-len 1024 --bf16 --quant 4bit`
+- 列表一致性评测（直算）：
+  - `python -m LLM.training.eval_llm_listwise --data .../val.listwise.teacher.jsonl --mode direct --model <base> --lora <adapter_dir> --bits 4 --input-max 1536 --target-max 192`
+- LLM 重排 → 检索评测：
+  - `python -m LLM.select.rerank_with_llm ...` → `python -m LLM.select.eval_retrieval ... --lambda-ce ... --lambda-bi ...`
+
+## 产物与路径（当前）
+
+- 数据：`/root/autodl-tmp/Training/datasets/listwise/{train,val}.listwise{.teacher}.jsonl`
+- 模型：
+  - 7B LoRA：`/root/autodl-tmp/Training/models/deepseek7b-listwise-lora`
+  - 32B LoRA：`/root/autodl-tmp/Training/models/goedel32b-listwise-lora`
+- 评测：
+  - LLM 直评指标：各自 out 目录下 `eval_listwise_direct.json`
+  - 检索评测：`metrics_llm7b.json`、`metrics_llm32b.json`（与 Bi/CE 可对比）
+
+---
+
+结论：当前 LLM 重排已具备可用性，但尚未稳定优于 CE/Bi。优先推进评测口径校准与目标分布调尖，随后引入候选级打分头与排序损失；同时做三方融合的小网格提升中深段 NDCG。在两张 H800 的资源下，上述计划可在两天内完成一轮闭环并复核指标。
+
 
 # iProver–LLM 并行方案白皮书（含：数据集生成详解 + 两条可落地方案）
 > 目标：基于你现有代码（`run_batch_pipeline.py / process_iprover_v3.py / iplog_to_dataset.py / batch_ranker.py`）同时实现并评测两条并行路线：  

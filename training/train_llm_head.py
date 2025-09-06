@@ -69,34 +69,17 @@ class ScoreHead(nn.Module):
         super().__init__()
         self.proj = nn.Linear(hidden, 1)
 
-    def forward(self, last_hidden: torch.Tensor, cand_pos_or_spans: List[List]):
+    def forward(self, last_hidden: torch.Tensor, cand_pos: List[List[int]]) -> torch.Tensor:
         # last_hidden: [B,T,H]
         B, T, H = last_hidden.size()
         out = []
         for b in range(B):
-            entries = cand_pos_or_spans[b]
-            if not entries:
+            idxs = cand_pos[b]
+            if not idxs:
                 out.append(torch.zeros(1, device=last_hidden.device))
                 continue
-            scores_b = []
-            for e in entries:
-                if isinstance(e, (list, tuple)) and len(e) == 2:
-                    st, ed = int(e[0]), int(e[1])
-                    # pool tokens inside span (exclusive of markers)
-                    st_eff = max(0, st + 1)
-                    ed_eff = max(st_eff + 1, min(T, ed))
-                    hs = last_hidden[b, st_eff:ed_eff, :]  # [L,H]
-                    if hs.numel() == 0:
-                        # fallback to start token if empty span
-                        hs = last_hidden[b, st:st+1, :]
-                    h = hs.mean(dim=0)  # [H]
-                else:
-                    # assume it's a single position
-                    pos = int(e)
-                    h = last_hidden[b, pos, :]  # [H]
-                s = self.proj(h)
-                scores_b.append(s)
-            s = torch.stack(scores_b, dim=0).squeeze(-1)  # [K]
+            hs = last_hidden[b, idxs, :]  # [K,H]
+            s = self.proj(hs).squeeze(-1)  # [K]
             out.append(s)
         # pad to same K per batch by right-padding with very negative scores
         K = max(x.size(0) for x in out)
@@ -109,80 +92,18 @@ class ScoreHead(nn.Module):
         return torch.stack(padded, dim=0)  # [B,K]
 
 
-def _locate_spans(input_ids: torch.Tensor, start_id: int, end_id: int) -> List[List[tuple]]:
-    spans: List[List[tuple]] = []
-    for seq in input_ids.tolist():
-        starts = []
-        tmp = []
-        for i, tid in enumerate(seq):
-            if tid == start_id:
-                starts.append(i)
-            elif tid == end_id and starts:
-                st = starts.pop(0)
-                tmp.append((st, i))
-        spans.append(tmp)
-    return spans
-
-
-def build_batch(
-    batch: List[GroupItem],
-    tok: AutoTokenizer,
-    max_len: int,
-    cand_max_chars: int = 0,
-    reorder_by_target: bool = False,
-    max_cands_per_group: int = 0,
-    pseudo_target_from_labels: bool = False,
-):
-    texts: List[str] = []
-    targets: List[Optional[List[float]]] = []
-    for x in batch:
-        cands = x.cands
-        tgt = x.target
-        # reorder by target if requested and sizes match
-        if reorder_by_target and tgt is not None and isinstance(tgt, (list, tuple)):
-            try:
-                idxs = list(range(len(cands)))
-                # pad tgt to len(cands) if shorter so zip doesn't drop
-                if len(tgt) < len(cands):
-                    tgt = list(tgt) + [0.0] * (len(cands) - len(tgt))
-                # sort by target desc
-                idxs.sort(key=lambda i: float(tgt[i]) if i < len(tgt) and isinstance(tgt[i], (int, float)) else 0.0, reverse=True)
-                if max_cands_per_group and max_cands_per_group > 0:
-                    idxs = idxs[:max_cands_per_group]
-                cands = [cands[i] for i in idxs]
-                tgt = [tgt[i] if i < len(tgt) else 0.0 for i in idxs]
-            except Exception:
-                # fall back to original order
-                pass
-        else:
-            if max_cands_per_group and max_cands_per_group > 0:
-                cands = cands[:max_cands_per_group]
-                if isinstance(tgt, (list, tuple)):
-                    tgt = list(tgt)[:len(cands)]
-
-        texts.append(format_prompt(x.query, cands, cand_max_chars=cand_max_chars))
-        if tgt is None and pseudo_target_from_labels:
-            # Build a simple non-uniform pseudo target from label*weight
-            vals = []
-            for c in cands:
-                lab = c.get("label", 0.0)
-                w = c.get("weight", 1.0)
-                try:
-                    v = float(lab) * float(w)
-                except Exception:
-                    v = 0.0
-                if not (v == v) or v == float("inf") or v == float("-inf"):
-                    v = 0.0
-                vals.append(max(0.0, v))
-            targets.append(vals)
-        else:
-            targets.append(tgt if tgt is not None else None)
-
+def build_batch(batch: List[GroupItem], tok: AutoTokenizer, max_len: int, cand_max_chars: int = 0):
+    texts = [format_prompt(x.query, x.cands, cand_max_chars=cand_max_chars) for x in batch]
     enc = tok(texts, max_length=max_len, truncation=True, padding=True, return_tensors="pt")
-    start_id = tok.convert_tokens_to_ids("<CAND_START>")
-    end_id = tok.convert_tokens_to_ids("<CAND_END>")
-    cand_spans = _locate_spans(enc.input_ids, start_id, end_id)
-    return enc, cand_spans, targets
+    cand_id = tok.convert_tokens_to_ids("<CAND_START>")
+    cand_pos = locate_token_positions(enc.input_ids, cand_id)
+    targets = []
+    for x in batch:
+        tgt = x.target
+        if tgt is None:
+            tgt = None
+        targets.append(tgt)
+    return enc, cand_pos, targets
 
 
 def kl_divergence(p_star: torch.Tensor, p_hat: torch.Tensor, eps: float = 1e-8):
@@ -238,9 +159,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing (may require disable use_cache)")
     ap.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm (0 to disable)")
-    ap.add_argument("--reorder-by-target", action="store_true", help="Reorder candidates by target_scores desc to keep high-signal ones in context")
-    ap.add_argument("--max-cands-per-group", type=int, default=16, help="Cap number of candidates per group included in the prompt")
-    ap.add_argument("--pseudo-target-from-labels", action="store_true", help="If target_scores is missing, build pseudo targets from label*weight")
     ap.add_argument("--save", type=Path, required=True)
     args = ap.parse_args(argv)
 
@@ -285,7 +203,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         k_stats = []
         for j in range(sample_n):
             gi = train_ds[j]
-            enc, cand_pos, targets = build_batch([gi], tok, args.max_len, cand_max_chars=args.cand_max_chars, reorder_by_target=args.reorder_by_target, max_cands_per_group=args.max_cands_per_group, pseudo_target_from_labels=args.pseudo_target_from_labels)
+            enc, cand_pos, targets = build_batch([gi], tok, args.max_len, cand_max_chars=args.cand_max_chars)
             k_eff = len(cand_pos[0]) if cand_pos else 0
             k_stats.append(k_eff)
             tlist = gi.target
@@ -329,7 +247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         accum = 0
         for i in pbar:
             batch = [train_ds[j] for j in range(i, min(i + args.batch, len(train_ds)))]
-            enc, cand_pos, targets = build_batch(batch, tok, args.max_len, cand_max_chars=args.cand_max_chars, reorder_by_target=args.reorder_by_target, max_cands_per_group=args.max_cands_per_group, pseudo_target_from_labels=args.pseudo_target_from_labels)
+            enc, cand_pos, targets = build_batch(batch, tok, args.max_len, cand_max_chars=args.cand_max_chars)
             for k in enc:
                 enc[k] = enc[k].to(device)
             out = model(**enc, output_hidden_states=True)
@@ -399,7 +317,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         dev_losses = []
         with torch.no_grad():
             for j in range(len(dev_ds)):
-                enc, cand_pos, targets = build_batch([dev_ds[j]], tok, args.max_len, cand_max_chars=args.cand_max_chars, reorder_by_target=args.reorder_by_target, max_cands_per_group=args.max_cands_per_group, pseudo_target_from_labels=args.pseudo_target_from_labels)
+                enc, cand_pos, targets = build_batch([dev_ds[j]], tok, args.max_len, cand_max_chars=args.cand_max_chars)
                 for k in enc:
                     enc[k] = enc[k].to(device)
                 out = model(**enc, output_hidden_states=True)

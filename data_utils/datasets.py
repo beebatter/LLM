@@ -3,12 +3,12 @@
 Lightweight datasets for Bi-Encoder and Cross-Encoder training using the shared
 logic tokenizer/normalizer with structure prefix and <Q>/<D> wrappers.
 
-Each JSONL is expected to contain fields:
-  - problem_name (optional)
-  - conjecture_text or conjecture_sig (string)
-  - text (clause string)
-  - features (dict) optional
-  - label (int) optional for classification
+Each JSONL row can use any of these equivalent fields:
+    - problem_name (optional)
+    - conjecture_text | conjecture_sig | query | text_a (string)
+    - text | doc | text_b (clause string)
+    - features (dict) or meta (dict) optional; meta keys like unit/horn/epr/born/conj_dist are supported
+    - label (int) optional for classification
 
 This is minimal and can be adapted to your existing trainer loops.
 """
@@ -64,11 +64,20 @@ class BiEncoderDataset:
 
     def __iter__(self) -> Iterator[Tuple[List[int], List[int]]]:
         for j in self.reader:
-            d = j.get("text")
+            # Accept multiple schema variants for doc/clause text
+            d = j.get("text") or j.get("doc") or j.get("text_b")
             if not d:
                 continue
-            q = j.get("conjecture_text") or j.get("conjecture_sig") or ""
-            features = j.get("features") or {}
+            # Accept multiple schema variants for conjecture/query text
+            q = (
+                j.get("conjecture_text")
+                or j.get("conjecture_sig")
+                or j.get("query")
+                or j.get("text_a")
+                or ""
+            )
+            # Prefer features, but fall back to meta if present
+            features = j.get("features") or j.get("meta") or {}
             qn = normalize_text(q) if q else ""
             dn = normalize_text(d)
             qwrap = wrap_q(qn) if qn else ""
@@ -103,13 +112,22 @@ class CrossEncoderDataset:
 
     def __iter__(self) -> Iterator[List[int]]:
         for j in self.reader:
-            d = j.get("text")
+            # Accept multiple schema variants for doc/clause text
+            d = j.get("text") or j.get("doc") or j.get("text_b")
             if not d:
                 continue
-            q = j.get("conjecture_text") or j.get("conjecture_sig") or ""
+            # Accept multiple schema variants for conjecture/query text
+            q = (
+                j.get("conjecture_text")
+                or j.get("conjecture_sig")
+                or j.get("query")
+                or j.get("text_a")
+                or ""
+            )
             if not q:
                 continue
-            features = j.get("features") or {}
+            # Prefer features, but fall back to meta if present
+            features = j.get("features") or j.get("meta") or {}
             qn = normalize_text(q)
             dn = normalize_text(d)
             qwrap = wrap_q(qn)

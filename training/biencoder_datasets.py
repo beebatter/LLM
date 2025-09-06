@@ -6,12 +6,9 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-import random
-import math
-from collections import defaultdict, deque
+import hashlib
 
 from LLM.data_utils.logic_tokenizer import LogicSentencePiece, normalize_text, features_to_prefix, PrefixBuckets
-import hashlib
 
 
 def _wrap_q(text: str) -> str:
@@ -33,12 +30,12 @@ class QDItem:
 
 
 class BiPairDataset(Dataset):
-    """JSONL schema is flexible. Accepts any of these keys:
-    - q: conjecture_text | conjecture_sig | query | q
-    - d: text | doc | d | clause | premise
+    """JSONL schema是灵活的，接受如下字段别名：
+    - q: conjecture_text | conjecture_sig | query | q | conjecture
+    - d: text_b | text | doc | d | clause | premise
     - features: features | meta
-    - label: label (defaults to 0.0 when missing)
-    - problem_name: problem_name | problem | qid (defaults to '<UNK>')
+    - label: label（缺省为0.0）
+    - problem_name: problem_name | problem | qid（缺省"<UNK>"）
     """
 
     def __init__(self, jsonl_paths: List[str], limit: Optional[int] = None) -> None:
@@ -59,7 +56,7 @@ class BiPairDataset(Dataset):
                     except Exception:
                         continue
                     q = get_first(j, ["conjecture_text", "conjecture_sig", "query", "q", "conjecture"])  # type: ignore[assignment]
-                    d = get_first(j, ["text", "doc", "d", "clause", "premise"])  # type: ignore[assignment]
+                    d = get_first(j, ["text_b", "text", "doc", "d", "clause", "premise"])  # type: ignore[assignment]
                     if not q or not d:
                         continue
                     features = get_first(j, ["features", "meta"])  # may be dict or None
@@ -93,15 +90,9 @@ class BiCollate:
         d_masks: List[List[int]] = []
         labels: List[float] = []
         buckets: List[str] = []
-<<<<<<< HEAD
-        # build query-group ids within batch
-        gid_map: Dict[str, int] = {}
-        next_gid = 0
-        q_group_ids: List[int] = []
-=======
         problems: List[str] = []
         d_hashes: List[str] = []
->>>>>>> ddb8195ae6c9e30062ec225eba6c1f87730e53e2
+
         for it in batch:
             q_s = _wrap_q(it.q)
             d_s = _wrap_d(it.d, it.features)
@@ -115,27 +106,18 @@ class BiCollate:
             # bucket key derived from features (same logic as prefix)
             bucket_key = features_to_prefix(it.features or {}, PrefixBuckets())
             buckets.append(bucket_key or "<UNK>")
-<<<<<<< HEAD
-            # group key: normalized raw query text
-            gkey = normalize_text(it.q)
-            if gkey not in gid_map:
-                gid_map[gkey] = next_gid
-                next_gid += 1
-            q_group_ids.append(gid_map[gkey])
-=======
             problems.append(it.problem_name or "<UNK>")
             # stable id for doc: md5 of normalized raw doc string
             norm_d = normalize_text(it.d)
             d_hash = hashlib.md5(norm_d.encode("utf-8")).hexdigest()
             d_hashes.append(d_hash)
->>>>>>> ddb8195ae6c9e30062ec225eba6c1f87730e53e2
 
         def pad(arrs: List[List[int]], pad_id: int) -> torch.Tensor:
-            maxl = max(len(x) for x in arrs)
+            maxl = max(len(x) for x in arrs) if arrs else 0
             return torch.tensor([x + [pad_id] * (maxl - len(x)) for x in arrs], dtype=torch.long)
 
         def padm(arrs: List[List[int]]) -> torch.Tensor:
-            maxl = max(len(x) for x in arrs)
+            maxl = max(len(x) for x in arrs) if arrs else 0
             return torch.tensor([x + [0] * (maxl - len(x)) for x in arrs], dtype=torch.long)
 
         return {
@@ -145,85 +127,11 @@ class BiCollate:
             "d_mask": padm(d_masks),
             "labels": torch.tensor(labels, dtype=torch.float),
             "bucket": buckets,
-<<<<<<< HEAD
-            "q_group_ids": torch.tensor(q_group_ids, dtype=torch.long),
-=======
             "problem": problems,
             "d_hash": d_hashes,
->>>>>>> ddb8195ae6c9e30062ec225eba6c1f87730e53e2
         }
 
 
 def build_bi_dataloader(paths: List[str], spm_model: str, batch_size: int = 256, shuffle: bool = True, num_workers: int = 2, max_len: int = 256, limit: Optional[int] = None) -> DataLoader:
     ds = BiPairDataset(paths, limit=limit)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=BiCollate(spm_model, max_len=max_len))
-
-
-class ProblemGroupedBatchSampler:
-    """
-    Batch sampler that groups samples by problem_name to provide multiple positives per batch.
-    Heuristic: in each batch, include chunks of size 'chunk' from distinct problems until reaching batch_size.
-    This increases the chance that SupCon sees multi-positive structure.
-    """
-
-    def __init__(self, dataset: BiPairDataset, batch_size: int, seed: int = 42):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.seed = seed
-        self._epoch = 0
-        # build problem -> deque(indices)
-        groups: dict[str, deque[int]] = defaultdict(deque)
-        rng = random.Random(seed)
-        for i, it in enumerate(dataset.items):
-            groups[it.problem_name or "<UNK>"].append(i)
-        # shuffle within each group
-        for k in list(groups.keys()):
-            arr = list(groups[k])
-            rng.shuffle(arr)
-            groups[k] = deque(arr)
-        self.groups = groups
-        self.group_keys = list(groups.keys())
-        rng.shuffle(self.group_keys)
-
-    def __iter__(self):
-        # New iterator that guarantees full coverage each epoch by round-robin over non-empty groups
-        rng = random.Random(self.seed + self._epoch)
-        self._epoch += 1
-        # working copy of groups with per-epoch reshuffle
-        groups: dict[str, deque[int]] = {}
-        for k, v in self.groups.items():
-            arr = list(v)
-            rng.shuffle(arr)
-            groups[k] = deque(arr)
-        active_keys = [k for k, q in groups.items() if len(q) > 0]
-        rng.shuffle(active_keys)
-        chunk = max(2, self.batch_size // 8)  # at least 2 per problem
-        batch: list[int] = []
-        while active_keys:
-            next_active: list[str] = []
-            for k in active_keys:
-                if len(batch) >= self.batch_size:
-                    yield batch
-                    batch = []
-                q = groups[k]
-                if not q:
-                    continue
-                take = min(chunk, self.batch_size - len(batch), len(q))
-                for _ in range(take):
-                    batch.append(q.popleft())
-                if len(q) > 0:
-                    next_active.append(k)
-            active_keys = next_active
-            rng.shuffle(active_keys)
-        if batch:
-            yield batch
-
-    def __len__(self) -> int:
-        n = len(self.dataset)
-        return max(1, math.ceil(n / max(1, self.batch_size)))
-
-
-def build_bi_dataloader_grouped(paths: List[str], spm_model: str, batch_size: int = 256, num_workers: int = 2, max_len: int = 256, limit: Optional[int] = None) -> DataLoader:
-    ds = BiPairDataset(paths, limit=limit)
-    sampler = ProblemGroupedBatchSampler(ds, batch_size=batch_size)
-    return DataLoader(ds, batch_sampler=sampler, num_workers=num_workers, collate_fn=BiCollate(spm_model, max_len=max_len))

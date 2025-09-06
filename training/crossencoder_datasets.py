@@ -32,7 +32,7 @@ class CrossDataset(Dataset):
         self.items: List[QDPair] = []
         self.group_to_indices: Dict[str, List[int]] = {}
 
-        def _get_first(dct: Dict, keys: List[str]):
+        def get_first(dct: Dict, keys: List[str]):
             for k in keys:
                 v = dct.get(k)
                 if v is not None:
@@ -49,7 +49,6 @@ class CrossDataset(Dataset):
                         j = json.loads(line)
                     except Exception:
                         continue
-<<<<<<< HEAD
                     # accept both pair and unified schemas
                     q = get_first(j, ["conjecture_text", "conjecture_sig", "query", "q", "conjecture", "text_a"])  # type: ignore[assignment]
                     d = get_first(j, ["text", "doc", "d", "clause", "premise", "text_b"])  # type: ignore[assignment]
@@ -58,14 +57,6 @@ class CrossDataset(Dataset):
                     features = get_first(j, ["features", "meta"]) or None
                     # grouping key: prefer explicit problem/query id, else md5 of normalized query
                     g = get_first(j, ["problem_name", "problem", "query_id", "qid", "qid_str"]) or md5(normalize_text(q))
-=======
-                    # Support both unified schema (text_a/text_b) and older fields
-                    q = _get_first(j, ["text_a", "conjecture_text", "conjecture_sig", "query", "q", "conjecture"])  # type: ignore[assignment]
-                    d = _get_first(j, ["text_b", "text", "doc", "d", "clause", "premise"])  # type: ignore[assignment]
-                    if not q or not d:
-                        continue
-                    features = _get_first(j, ["features", "meta"]) or None
->>>>>>> ddb8195ae6c9e30062ec225eba6c1f87730e53e2
                     lab = j.get("label")
                     try:
                         label = float(lab) if lab is not None else 0.0

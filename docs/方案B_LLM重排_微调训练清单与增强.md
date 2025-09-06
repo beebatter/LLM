@@ -78,6 +78,28 @@ python -m LLM.training.train_llm_lora \
 ```
 提示：这是“格式与任务对齐”的 SFT；先保格式稳定，再考虑进一步精度优化。
 
+小贴士（下载/缓存常见报错与处理）：
+- Connection reset by peer（transfer.xethub.hf.co / xet-core）
+  - 原因：启用了 hf_transfer（Xet 加速），网络抖动/防火墙导致连接被对端重置；会反复重试但不稳定。
+  - 处理：禁用加速，改走普通 HTTP 下载，并将并发降到 1。
+    - 临时：`export HF_HUB_ENABLE_HF_TRANSFER=0`；或卸载：`pip uninstall -y hf_transfer`。
+    - CLI（示例）：`hf download deepseek-ai/deepseek-math-7b-instruct --local-dir /autodl-tmp/models/deepseek-math-7b-instruct --max-workers 1`。
+- No space left on device（os error 28）
+  - 原因：大权重分片（~10GB）先写入临时目录再移动，TMP 或缓存分区空间不足；并发下载会放大量临时块文件。
+  - 处理：把缓存与 TMP 指到大盘，并清理残留 .incomplete。
+    - 环境变量：
+      - `export HF_HOME=/autodl-tmp/hf`
+      - `export HF_HUB_CACHE=/autodl-tmp/hf/cache`
+      - `export TRANSFORMERS_CACHE=/autodl-tmp/hf/transformers`
+      - `export TMPDIR=/autodl-tmp/tmp`
+      - 创建目录：`mkdir -p $HF_HOME $HF_HUB_CACHE $TRANSFORMERS_CACHE $TMPDIR`
+    - 清理残留：
+      - `find "$HF_HOME" -name "*.incomplete" -delete || true`
+      - 如需重来：`rm -rf "$HF_HOME"/hub/models--deepseek-ai--deepseek-math-7b-instruct`
+    - 重新下载（单线程）：
+      - `HF_HUB_ENABLE_HF_TRANSFER=0 hf download deepseek-ai/deepseek-math-7b-instruct --local-dir /autodl-tmp/models/deepseek-math-7b-instruct --max-workers 1`
+    - 训练时使用本地目录并加 `--local-only`：`--model /autodl-tmp/models/deepseek-math-7b-instruct --local-only`
+
 ### 1.4 本地推理服务（HTTP）
 ```bash
 python -m LLM.select.ranker_service \
@@ -248,6 +270,82 @@ python -m LLM.batch_ranker --input /root/Training/datasets/sample_scores_req.jso
    - 用 `tptp4X` 将 FOF 归约到 CNF（含所有公理与猜想子句）。
    - 规范化：变量归一（`X*→VAR`，本仓 `normalize_text` 已支持）、字面量排序（按谓词/极性/项序），得到 `canonical_formula`。注：排序可在生成脚本中实现，或以“目标符号优先”作为近似。
 3) 对齐金标正例
+## 9. 训练改进实现计划（基于当前评测现象）
+
+结论解读（现象→原因）
+- 7B Pearson≈0.05 但 MAE≈0.03：学到了“平均模板”，对窗口内相对强弱不敏感，排序信号不足。
+- 32B Pearson≈0.27：已开始捕捉差异，但相关性不高，仍受评测口径偏置与目标过于平滑影响。
+- 主要两类原因：
+  1) 打分/评测口径偏置（长度、频率/模板、候选相互干扰）；
+  2) 训练目标更像“生成 JSON 的 SFT”，而不是“候选级分布/排序学习”。
+
+### 9.1 立刻可做的评测校准（不改模型即可增益）
+- 平均对数似然（mean-LL）替代“总和”以消除长度偏置：s_mean = (1/|c|)·Σ log p(x_t|prompt)。
+- 逐候选独立前向，避免候选间注意力泄漏（不要同一前向里切片取每个候选分）。
+- 组内归一：对窗口内 {s_i} 做 z-score 或减中位数/除 MAD，再 softmax。
+- 温度/偏置标定：在 dev 拟合 p̂=softmax((s−b)/τ)，最小化 KL/CE 找 τ,b。
+- 可选 PMI 校准：s_PMI = log P(c|conj) − λ·log P(c)（λ∈[0.5,1.0] 网格搜）。
+
+实现落地（脚本改动最小）：
+- `LLM/training/eval_llm_listwise.py`
+  - 新增 `--score-type {sum-ll,mean-ll,pmi}`、`--isolate`（逐候选独立前向）、`--zscore`、`--calib-tau`、`--calib-bias`；
+  - PMI 需要额外跑一次“无猜想/通用提示”的基线得分（或缓存语料频率模型）。
+- `LLM/select/rerank_with_llm.py`
+  - 同步支持上述参数，作为离线重排器产出 CE 兼容格式。
+
+验收：Pearson、NDCG 明显上升，len_match_rate=1.0 保持。
+
+### 9.2 训练目标升级（候选级分布学习，替代生成 JSON）
+- 在每个候选段落外侧加 special tokens：`<CAND_START> ... <CAND_END>`。
+- 前向后在 `<CAND_START>` 位置取隐藏向量 h_i（或在候选范围内做平均池化）。
+- 线性打分头：s_i = w^T h_i + b；窗口分布 p̂=softmax(s)。
+- 损失：CE/KL 对齐教师分布 p*：L = CE(p*, p̂)；可混合少量 pairwise（margin/BT）作正则。
+- LoRA 仅加在打分头或上层 block，减少显存与收敛不稳。
+
+实现落地：
+- 新增/扩展训练脚本（建议）：`LLM/training/train_llm_listwise_sft.py` 支持 `--score-head` 模式：
+  - 构造含 `<CAND_START>/<CAND_END>` 的输入；
+  - 从模型隐层抽取候选向量，接线线性头，计算 listwise CE/KL；
+  - 保留已有 SFT 路径作为备选（JSON 输出模式）。
+
+### 9.3 教师分布增强（让正例内部“有强弱”）
+- 用 CE 的细粒度分数+温度 τ，给正例再分配权重：
+  - pos_weights = (1−α)·uniform + α·softmax(teacher/τ)；
+  - 在 dev 上对 (α, τ, 总质量 m) 网格搜，避免“平均模板”。
+- 没有高质量 CE 时，可用 TAGS 启发式分（如命中 conjecture 符号/常量≻其它），再配温度与混合权重。
+
+落地：
+- 增加 `scripts/target_dist_tuner.py`（或在现有融合脚本加调参流程），输出新的 `target_scores` 并重写训练集（仅替换 scores，不改样本）。
+
+### 9.4 训练细节优化（在你现配方上抛光）
+- 学习率：7B LoRA 建议 5e-5～1e-4；32B QLoRA 5e-5；epoch 2–3，带 warmup（0.03）与 cosine。
+- 候选随机化：每个 epoch 打乱候选顺序，目标同步重排。
+- 难负提升：提高 `given_nonproof` 类负例采样占比（例如 0.6），增强早段命中。
+- 混合教师蒸馏：直接蒸馏 CE logits（K 维 raw 分），小温度 τ=1–2。
+- 性能：H800 开启 flash‑attn/TF32；use_cache=False；梯度检查点；保证 tokenizer/embedding 尺寸一致。
+
+### 9.5 对症排查清单（按顺序执行）
+1) 评测改口径：mean‑LL + 逐候选独立 + z‑score + (τ,b) 标定 + 可选 PMI；
+2) 检查 direct‑softmax 实现：仅累积候选 TEXT token；正确 shift；剔除 PAD/EOS；各候选独立上下文；
+3) 用 `target_dist_tuner` 调尖分布（m, τ, α）；
+4) 若允许改模型：启用候选打分头 + listwise CE/KL；
+5) 复测 Hit@K/NDCG@K，并做 Bi+CE+LLM 三方网格融合（λ_ce, λ_bi, λ_llm）。
+
+### 9.6 两天落地排期（可直接执行）
+- Day 1：
+  - 实装评测口径参数：`--score-type mean-ll/pmi`、`--isolate`、`--zscore`、`--calib-*`；
+  - 跑 dev 标定 τ,b，选定是否用 PMI；
+  - 跑 `target_dist_tuner` 重写训练集 `target_scores`（更尖）。
+- Day 2：
+  - 7B：LoRA lr=1e-4，2–3 epoch，listwise KL；随机候选；难负 0.6；
+  - 32B：QLoRA lr=5e-5，2 epoch，同上；
+  - 评测：listwise 一致性（分数头/mean‑LL 口径）、Bi top‑200 重排 Hit@K/NDCG@K、三方融合小网格；
+  - 记录 metrics.json 与 λ 配置，固化到在线配置。
+
+### 9.7 成功判据与回退
+- 成功：Pearson 与 NDCG@32/64 提升；Hit@10 不下降或小幅上升；解析失败≈0；延迟在预算内；
+- 回退：若 7B 不收敛，先用 32B 作为教师蒸馏到 7B；或仅作为融合一员（提高中深段 NDCG）。
+
    - 从 TSTP 证明中抽取 c_# 列表，与全集 CNF 的条目按 `canonical_formula` 匹配 → 得到 label=1；其余条目按出现状态标负（given_nonproof / simplified / passive_only / never_seen）。
 4) 写出统一样本
    - 形如：`{problem_name, conjecture_text, text, canonical_formula, features, label, neg_bucket}`。

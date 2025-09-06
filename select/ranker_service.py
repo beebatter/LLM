@@ -24,6 +24,7 @@ class GenHandler(BaseHTTPRequestHandler):
     tok: Optional[AutoTokenizer] = None  # type: ignore
     mdl: Optional[AutoModelForCausalLM] = None  # type: ignore
     device: torch.device
+    input_max_len: int = 2048
 
     def do_POST(self):
         if self.path != "/generate":
@@ -43,7 +44,12 @@ class GenHandler(BaseHTTPRequestHandler):
         if not prompt or self.mdl is None or self.tok is None:
             self._respond({"text": ""})
             return
-        inputs = self.tok(prompt, return_tensors="pt").to(self.device)
+        inputs = self.tok(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.input_max_len,
+        ).to(self.device)
         with torch.no_grad():
             out = self.mdl.generate(
                 **inputs,
@@ -73,10 +79,33 @@ def main(argv=None) -> int:
     ap.add_argument("--lora", type=str, help="Optional LoRA adapter path")
     ap.add_argument("--host", type=str, default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8001)
+    ap.add_argument("--input-max", type=int, default=2048, help="cap prompt tokens; left-truncation is used")
+    # Optional RoPE scaling for longer context
+    ap.add_argument("--rope-type", type=str, default="none", choices=["none", "linear", "dynamic", "yarn"], help="Apply RoPE scaling to extend context")
+    ap.add_argument("--rope-factor", type=float, default=1.0, help="Scaling factor, e.g., 2.0 for ~8k if base is 4k")
+    ap.add_argument("--rope-base", type=int, default=None, help="Original max_position_embeddings; if None, try from model config")
     args = ap.parse_args(argv)
 
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     mdl = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+    # Apply optional RoPE scaling
+    try:
+        if args.rope_type != "none" and args.rope_factor and args.rope_factor > 1.0:
+            cfg = mdl.config
+            orig = int(args.rope_base) if args.rope_base else int(getattr(cfg, "max_position_embeddings", 4096))
+            cfg.rope_scaling = {  # type: ignore[attr-defined]
+                "type": args.rope_type,
+                "factor": float(args.rope_factor),
+                "original_max_position_embeddings": int(orig),
+            }
+            if hasattr(cfg, "max_position_embeddings"):
+                try:
+                    cfg.max_position_embeddings = int(orig * args.rope_factor)
+                except Exception:
+                    pass
+            print(f"[INFO] RoPE scaling enabled in service: {cfg.rope_scaling}")
+    except Exception as e:
+        print(f"[WARN] Failed to apply RoPE scaling in service: {e}")
     if args.lora:
         from peft import PeftModel
         mdl = PeftModel.from_pretrained(mdl, args.lora)
@@ -86,6 +115,12 @@ def main(argv=None) -> int:
     GenHandler.tok = tok
     GenHandler.mdl = mdl
     GenHandler.device = device
+    # Prefer left truncation to retain the tail with candidates and JSON spec
+    try:
+        tok.truncation_side = "left"  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    GenHandler.input_max_len = int(args.input_max)
     print(f"ranker service on http://{args.host}:{args.port}")
     server = HTTPServer((args.host, args.port), GenHandler)
     server.serve_forever()

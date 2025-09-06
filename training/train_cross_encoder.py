@@ -49,8 +49,6 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=256)
-    ap.add_argument("--pos-weight", type=float, default=1.0, help="Positive class weight for BCE; 1.0 means unweighted")
-    ap.add_argument("--init-from", type=Path, default=None, help="Path to a previous CE checkpoint to continue training from")
     ap.add_argument("--save", type=Path, default=Path("/home/ks/Training/models/cross_encoder_best.pt"))
     ap.add_argument("--logdir", type=Path, default=Path("/home/ks/Training/logs/crossencoder"))
     # loss & grouping options
@@ -59,7 +57,6 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--groups-per-batch", type=int, default=4, help="Groups per batch in listwise mode")
     args = ap.parse_args(argv)
 
-<<<<<<< HEAD
     # robust vocab size from SPM model or .vocab fallback
     vocab_size = None
     if spm is not None:
@@ -82,51 +79,12 @@ def main(argv: List[str] | None = None) -> int:
         pad_id=0,
         max_len=args.max_len,
     )
-=======
->>>>>>> ddb8195ae6c9e30062ec225eba6c1f87730e53e2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Build or resume model
-    if args.init_from is not None:
-        ckpt = torch.load(args.init_from, map_location="cpu")
-        cfg = TransformerConfig(**ckpt["config"])  # type: ignore
-        # Ensure we use the same SPM model as in the checkpoint to avoid vocab mismatch
-        try:
-            ckpt_spm = ckpt.get("spm_model")
-            if ckpt_spm:
-                args.spm = ckpt_spm  # type: ignore[assignment]
-        except Exception:
-            pass
-        enc = TransformerEncoder(cfg).to(device)
-        head = CrossHead(cfg.d_model).to(device)
-        try:
-            enc.load_state_dict(ckpt["encoder_state"])  # type: ignore[arg-type]
-            head.load_state_dict(ckpt["head_state"])  # type: ignore[arg-type]
-            print(f"resumed from: {args.init_from}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load checkpoint {args.init_from}: {e}")
-    else:
-        spm_vocab = Path(args.spm).with_suffix(".vocab")
-        with open(spm_vocab, "r", encoding="utf-8") as f:
-            vocab_size = sum(1 for _ in f)
-        cfg = TransformerConfig(
-            vocab_size=vocab_size,
-            d_model=args.d_model,
-            n_heads=args.heads,
-            n_layers=args.layers,
-            pad_id=0,
-            max_len=args.max_len,
-        )
-        enc = TransformerEncoder(cfg).to(device)
-        head = CrossHead(cfg.d_model).to(device)
+    enc = TransformerEncoder(cfg).to(device)
+    head = CrossHead(cfg.d_model).to(device)
     params = list(enc.parameters()) + list(head.parameters())
     opt = AdamW(params, lr=args.lr)
-    # BCE with optional positive weighting
-    if args.pos_weight and abs(args.pos_weight - 1.0) > 1e-9:
-        pw = torch.tensor([float(args.pos_weight)], dtype=torch.float32, device=device)
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
-    else:
-        loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss()
 
     if args.loss == "listwise":
         train_loader = build_cross_grouped_dataloader(

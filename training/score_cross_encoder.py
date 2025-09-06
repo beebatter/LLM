@@ -51,14 +51,13 @@ def load_model(model_path: Path, d_model_default: int = 512, layers_default: int
 
 
 def main(argv: List[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Score pairs with Cross-Encoder and dump ce_scored JSONL; optionally also write unified predictions JSONL")
+    ap = argparse.ArgumentParser(description="Score pairs with Cross-Encoder and dump ce_scored JSONL")
     ap.add_argument("--data", action="append", required=True)
     ap.add_argument("--model", type=Path, required=True)
     ap.add_argument("--spm", type=Path, required=False, help="Unused here; model cfg holds vocab size")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--pred-out", type=Path, default=None, help="Optional unified predictions JSONL path for unified_evaluator.py")
     args = ap.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,7 +83,6 @@ def main(argv: List[str] | None = None) -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fout = args.out.open("w", encoding="utf-8")
-    fpred = args.pred_out.open("w", encoding="utf-8") if args.pred_out else None
     try:
         B = args.batch
         for i in tqdm(range(0, len(ds), B), desc="score", dynamic_ncols=True):
@@ -113,24 +111,10 @@ def main(argv: List[str] | None = None) -> int:
                 if it.features is not None:
                     obj["features"] = it.features
                 fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-                if fpred is not None:
-                    pred = {
-                        "problem_name": it.group,
-                        "query": it.q,
-                        "group_id": f"{it.group}||{it.q}",
-                        "doc": it.d,
-                        "label": float(it.label),
-                        "score": float(s),
-                    }
-                    fpred.write(json.dumps(pred, ensure_ascii=False) + "\n")
     finally:
         fout.close()
-        if fpred is not None:
-            fpred.close()
 
     print(f"wrote: {args.out}")
-    if args.pred_out:
-        print(f"wrote predictions: {args.pred_out}")
     return 0
 
 
