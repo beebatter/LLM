@@ -846,9 +846,9 @@ $$P_{vib} = 0.015 f^3 + 0.10 f$$
 
 $$P_{now} = P_{belt} + P_{vib}$$
 
-$$\text{energy\_per\_ton} = \frac{\overline{P_{now}} \cdot T_{sim}}{\text{total\_ton}}$$
+$$E_{ton} = \frac{\overline{P_{now}} \cdot T_{sim}}{m_{total}}$$
 
-其中 $\text{total\_ton} = \int_0^{T_{sim}} q \, dt / 3600$
+其中 $m_{total} = \int_0^{T_{sim}} q \, dt / 3600$
 
 ### 11.4 机械健康指标
 
