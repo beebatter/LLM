@@ -541,100 +541,104 @@ python3 process_iprover_v3.py serve --pipeline B_llm_rerank --select-top-k 1024 
 
 > 本白皮书对应的最小代码改动点均已列出，并提供了可执行的命令串。你可以先实现 **方案 A**（无需大模型服务，工程阻力小），并并行准备 **方案 B** 的 QLoRA 数据与脚本，两周内即可拉起对比评测。
 
-<<<<<<< HEAD
+---
 
-LLM 最终方案：
+## LLM 最终方案
 
-要点评审与微调
+### 要点评审与微调
+- A 路线（打分头一次出 K 分）
+  优点：时延低、吞吐高、训练目标可直接对齐教师分布（Listwise CE/KL）。
+  风险：标记位定位与长度控制。建议用 <CAND_START>/<CAND_END> 标记候选边界，仅取 <CAND_START> 位置隐向量（或区间平均）喂线性头，K 先用 32/48，再观察显存与收敛推到 64。
+  训练目标：组内 softmax 后做 CE/KL，温度 τ 在 0.5–1.5 搜索；同时保留 z-score + 偏置 b 的后标定。
+- B 路线（逐候选 PLL/PMI）
+  优点：零改模、口径稳定、可直接上线或充当强教师；对 32B 很合适。
+  风险：慢 K 倍；注意“逐候选独立前向”（避免候选互看）；长度偏置用“平均 LL”，并做 PMI 校正（λ∈[0.5,1.0]）。
 
-A 路线（打分头一次出 K 分）
-优点：时延低、吞吐高、训练目标可直接对齐教师分布（Listwise CE/KL）。
-风险：标记位定位与长度控制。建议用 <CAND_START>/<CAND_END> 标记候选边界，仅取 <CAND_START> 位置隐向量（或区间平均）喂线性头，K 先用 32/48，再观察显存与收敛推到 64。
-训练目标：组内 softmax 后做 CE/KL，温度 τ 在 0.5–1.5 搜索；同时保留 z-score + 偏置 b 的后标定。
-B 路线（逐候选 PLL/PMI）
-优点：零改模、口径稳定、可直接上线或充当强教师；对 32B 很合适。
-风险：慢 K 倍；注意“逐候选独立前向”（避免候选互看）；长度偏置用“平均 LL”，并做 PMI 校正（λ∈[0.5,1.0]）。
-数据与难负
-你的“listwise 组内候选 + 难负占比≥60% + 每 epoch 打乱顺序”是对的；注意 target_scores 要随顺序打乱一起重排。
-教师融合：p* = w_bi p_bi + w_ce p_ce + w_llm32 p_llm32，分早段（Hit@10）与中深段（NDCG@32）分别拟合权重，统一口径很关键。
-special tokens 与对齐
-一定添加 <CAND_START>/<CAND_END> 和结构前缀为 special tokens；resize_token_embeddings 并设置 pad/eos 对齐；use_cache=False + gradient_checkpointing 以节省显存。
-指标与标定
-指标：NDCG@{10,32}、Hit@{10,32}、与教师分布的 KL/MAE/Pearson。
-标定：组内 z-score → (τ,b) 在 dev 上拟合，写 calib.yaml，训练/评测/上线统一使用。
-逐步落地（建议执行顺序）
+### 数据与难负
+- 你的“listwise 组内候选 + 难负占比≥60% + 每 epoch 打乱顺序”是对的；注意 target_scores 要随顺序打乱一起重排。
+- 教师融合：p* = w_bi p_bi + w_ce p_ce + w_llm32 p_llm32，分早段（Hit@10）与中深段（NDCG@32）分别拟合权重，统一口径很关键。
 
-数据成形（两模型通用）
-生成 listwise 训练样本（K=48 起步）：conjecture + candidates[i].text/tags + target_scores[i]（来自 p* 融合或 CE 单源起步）。
-提升难负占比（≥60%），并保证每个 query 至少 1 个正例。
-规范化文本与结构标记（你已有），并插入 <CAND_START>/<CAND_END>；记录每个候选的 <CAND_START> 索引供打分头提取。
-DeepSeek‑Prover‑V2‑7B（主力在线打分器）
-训练（LoRA + 打分头）
-LoRA: r=16, α=32, dropout=0.05，target_modules=[q,k,v,o]；bf16；gradient_checkpointing=True；flash‑attn 可开则开。
-优化：AdamW lr=1e-4 wd=0.01，cosine + warmup_ratio=0.03；epochs=2–3；batch=1 grad_accum=16（等效 bs=16）；max_len=1024。
-损失：组内 softmax(s/τ) 与 p* 做 CE/KL，τ∈{0.7,1.0,1.3} 网格。
-标定与评测
-dev 上拟合 z-score/τ/b，报告 NDCG/Hit 与 KL/MAE/Pearson。
-上线
-批量输入每个 query 的 K 候选，一次前向产分；开启 prefix‑cache（只变 <D> 段）降时延。
-融合 Bi（w_bi≈0.2, w_llm≈0.8），先在灰度流量验证。
-Goedel‑Prover‑V2‑32B（高精教师 & 离线重排）
-路线 A：QLoRA + 打分头（1–2 epoch）
-量化：4‑bit nf4 + double_quant，compute_dtype=bf16；LoRA: r=16, α=32, dropout=0.05；lr=5e-5。
-目标：对齐 p*，作为“高质量重排器/教师”，离线重排 CE Top‑M（如 256）并缓存。
-路线 B：PMI（零改造）
-逐候选前向，score=avg_logP(c|q)−λ·avg_logP(c)；λ 网格；组内 z‑score + (τ,b) 标定。
-用其分布替换/融入 p*，给 7B 蒸馏。
-蒸馏与协同
-用 32B‑PMI 或 32B‑Head 的分布，联合 CE/Bi 形成 p*；蒸馏到 7B‑Head（CE→Bi 的经验同样适用）。
-线上：7B‑Head 为主，Bi 融合；离线：32B 重排/复核低置信度样本；统一 calib.yaml。
-风险与兜底
-长度/显存：K×长度接近上限时，优先降 K→48，再裁长度（例如 896）；必要时按候选长短分批。
-标记位定位：必须在 tokenized 序列中准确获取每个 <CAND_START> 的位置，错位会“学不动”。
-候选互看：仅限 A 路线；B 路线坚持逐候选独立前向。
-数据泄漏：train/dev/test 按 query 去重，防止跨集合泄漏。
-可直接执行的小清单
+### Special Tokens 与对齐
+- 一定添加 <CAND_START>/<CAND_END> 和结构前缀为 special tokens；resize_token_embeddings 并设置 pad/eos 对齐；use_cache=False + gradient_checkpointing 以节省显存。
 
-先跑 7B‑Head（K=48，τ=1.0，2 epoch）+ dev 标定，做线上 A/B 与 CE 对比。
-并行跑 32B‑PMI 作为教师/离线重排，合成 p* 蒸馏回 7B‑Head。
-收敛后再把 K 提到 64，更新 calib 与融合权重。
-需要的话，我可以：
+### 指标与标定
+- 指标：NDCG@{10,32}、Hit@{10,32}、与教师分布的 KL/MAE/Pearson。
+- 标定：组内 z-score → (τ,b) 在 dev 上拟合，写 calib.yaml，训练/评测/上线统一使用。
 
-写最小化训练脚本（peft/transformers）实现「打分头 + LoRA + listwise CE/KL」和「PMI scorer + 标定」；
-衔接一个 Ranker 封装，直接替换你当前重排调用，输出口径与 CE 一致。
-=======
+### 逐步落地
+
+#### 数据成形（两模型通用）
+- 生成 listwise 训练样本（K=48 起步）：conjecture + candidates[i].text/tags + target_scores[i]（来自 p* 融合或 CE 单源起步）。
+- 提升难负占比（≥60%），并保证每个 query 至少 1 个正例。
+- 规范化文本与结构标记（你已有），并插入 <CAND_START>/<CAND_END>；记录每个候选的 <CAND_START> 索引供打分头提取。
+
+#### DeepSeek‑Prover‑V2‑7B（主力在线打分器）
+- 训练（LoRA + 打分头）
+  LoRA: r=16, α=32, dropout=0.05，target_modules=[q,k,v,o]；bf16；gradient_checkpointing=True；flash‑attn 可开则开。
+  优化：AdamW lr=1e-4 wd=0.01，cosine + warmup_ratio=0.03；epochs=2–3；batch=1 grad_accum=16（等效 bs=16）；max_len=1024。
+  损失：组内 softmax(s/τ) 与 p* 做 CE/KL，τ∈{0.7,1.0,1.3} 网格。
+- 标定与评测
+  dev 上拟合 z-score/τ/b，报告 NDCG/Hit 与 KL/MAE/Pearson。
+- 上线
+  批量输入每个 query 的 K 候选，一次前向产分；开启 prefix-cache（只变 <D> 段）降时延。
+  融合 Bi（w_bi≈0.2, w_llm≈0.8），先在灰度流量验证。
+
+#### Goedel‑Prover‑V2‑32B（高精教师与离线重排）
+- 路线 A：QLoRA + 打分头（1–2 epoch）
+  量化：4-bit nf4 + double_quant，compute_dtype=bf16；LoRA: r=16, α=32, dropout=0.05；lr=5e-5。
+  目标：对齐 p*，作为“高质量重排器/教师”，离线重排 CE Top-M（如 256）并缓存。
+- 路线 B：PMI（零改造）
+  逐候选前向，score=avg_logP(c|q)−λ·avg_logP(c)；λ 网格；组内 z-score + (τ,b) 标定。
+  用其分布替换或融入 p*，给 7B 蒸馏。
+
+### 蒸馏与协同
+- 用 32B-PMI 或 32B-Head 的分布，联合 CE/Bi 形成 p*；蒸馏到 7B-Head（CE→Bi 的经验同样适用）。
+- 线上：7B-Head 为主，Bi 融合；离线：32B 重排/复核低置信度样本；统一 calib.yaml。
+
+### 风险与兜底
+- 长度/显存：K×长度接近上限时，优先降 K→48，再裁长度（例如 896）；必要时按候选长短分批。
+- 标记位定位：必须在 tokenized 序列中准确获取每个 <CAND_START> 的位置，错位会“学不动”。
+- 候选互看：仅限 A 路线；B 路线坚持逐候选独立前向。
+- 数据泄漏：train/dev/test 按 query 去重，防止跨集合泄漏。
+
+### 可直接执行的小清单
+- 先跑 7B-Head（K=48，τ=1.0，2 epoch）+ dev 标定，做线上 A/B 与 CE 对比。
+- 并行跑 32B-PMI 作为教师/离线重排，合成 p* 蒸馏回 7B-Head。
+- 收敛后再把 K 提到 64，更新 calib 与融合权重。
+- 需要的话，可以继续补最小化训练脚本（peft/transformers）实现“打分头 + LoRA + listwise CE/KL”和“PMI scorer + 标定”，再衔接一个 Ranker 封装，直接替换当前重排调用，输出口径与 CE 一致。
+
 ---
 
 ## 已完成（方案 A 对齐进度与下一步）
 
 ### 概览
-- 已完成：§3.1 Bi‑Encoder 训练、§3.2 索引构建（离线）、§3.3 Cross‑Encoder 训练与离线精排/评测。
+- 已完成：§3.1 Bi-Encoder 训练、§3.2 索引构建（离线）、§3.3 Cross-Encoder 训练与离线精排/评测。
 - 待完成：§3.2 在线接入（EA 串联）、§3.4 分数融合与调度，以及题内增量库与 LRU 缓存。
 
-### 3.1 Bi‑Encoder（SELECT）训练
+### 3.1 Bi-Encoder（SELECT）训练
 - Done
   - 双塔 Transformer，采用 SupCon（按 problem 分组正例）对比学习；AMP + AdamW + warmup+cosine。
   - 验证集按 problem 的 Recall@K（K=32/64）评测；R@64 ≈ 0.926（稳定）。
   - 导出 best.pt 与 SentencePiece spm.model。
 - Partial
-  - 周期性难负挖掘尚未并入训练循环（当前仅 in‑batch 负与自然难例）。
+  - 周期性难负挖掘尚未并入训练循环（当前仅 in-batch 负与自然难例）。
 - Note
   - SupCon 与 InfoNCE 为同类对比学习目标，可继续沿用或在此基础上加入难负。
 
 ### 3.2 FAISS 建库与在线 SELECT
 - Done
   - 已离线编码并构建索引（Flat/IP，向量 L2 归一化≈余弦）；产出 .npz/.faiss 与丰富 .meta.jsonl。
-  - select_service.py 可加载索引与模型进行 Top‑K；batch_select.py 已用于候选生成。
+  - select_service.py 可加载索引与模型进行 Top-K；batch_select.py 已用于候选生成。
 - Partial
   - 题内库增量 add 与 text→vector LRU 缓存未实现。
   - EA 接入：process_iprover_v3.py 尚未在 scores_req 前串联 SELECT 调用。
 - 计划差异
-  - 白皮书建议 HNSW/IVF‑PQ 用于大库加速；当前为 Flat，后续可替换评估。
+  - 白皮书建议 HNSW/IVF-PQ 用于大库加速；当前为 Flat，后续可替换评估。
 
-### 3.3 Cross‑Encoder（Transformer）RERANK 训练
+### 3.3 Cross-Encoder（Transformer）RERANK 训练
 - Done
   - 数据：按题切分并做文档级排他，构建 train/val/test（无泄漏）。
-  - 训练：6 层 / hidden 512，BCEWithLogits；支持 init‑from 与 pos_weight；val AUC ≈ 0.988–0.989。
+  - 训练：6 层 / hidden 512，BCEWithLogits；支持 init-from 与 pos_weight；val AUC ≈ 0.988–0.989。
   - 工具：rerank_with_cross_encoder.py 离线精排；eval_retrieval.py 计算 Hit/Recall/NDCG。
 - Partial
   - 在线：batch_ranker.py 的 cross_encoder 后端与 EA 串联尚未落地。
@@ -643,10 +647,10 @@ Goedel‑Prover‑V2‑32B（高精教师 & 离线重排）
 ### 3.4 分数融合与调度
 - Todo
   - 实现 S = λ1·S_cross + λ2·S_bi + λ3·S_heur 的网格搜索与在线融合。
-  - 调度：Top‑M(cross) + Oldest M1 + Lightest M2 + ε 随机；失败回退与日志保留。
+  - 调度：Top-M(cross) + Oldest M1 + Lightest M2 + ε 随机；失败回退与日志保留。
 
 ### 离线端到端评测（无泄漏 test，小样本）
-- 设置：Bi‑Encoder 检索 K=200 → Cross‑Encoder 精排；n_queries = 27。
+- 设置：Bi-Encoder 检索 K=200 → Cross-Encoder 精排；n_queries = 27。
 - 指标：
   - Bi Hit@K：@64 ≈ 0.518，@200 ≈ 0.630；CE Hit@K：@64 ≈ 0.556，@200 ≈ 0.630。
   - Bi Recall@K：@64 ≈ 0.0626，@200 ≈ 0.1778；CE Recall@K：@64 ≈ 0.1097，@200 ≈ 0.1778。
@@ -658,6 +662,5 @@ Goedel‑Prover‑V2‑32B（高精教师 & 离线重排）
 ### 下一步（优先级）
 1) 在线打通：process_iprover_v3.py 在 scores_req 前调用 SELECT → 交给 batch_ranker.py(cross_encoder) → 回包；保留启发式回退与详尽日志。
 2) 召回与稳定性：将候选 K 提至 500/1000；扩大 test 题集；同步报告 reachable recall（扣除未覆盖正例）。
-3) 融合与调度：离线网格搜索 λ1/λ2/λ3（目标 NDCG@64/100）；在 EA 端实现融合与 Top‑M + Oldest/Lightest/ε 调度策略。
-4) 难负与索引：加入周期性难负挖掘微调 Bi；评估并切换 HNSW/IVF‑PQ；实现题内增量库与 text→vector LRU 缓存。
->>>>>>> ddb8195ae6c9e30062ec225eba6c1f87730e53e2
+3) 融合与调度：离线网格搜索 λ1/λ2/λ3（目标 NDCG@64/100）；在 EA 端实现融合与 Top-M + Oldest/Lightest/ε 调度策略。
+4) 难负与索引：加入周期性难负挖掘微调 Bi；评估并切换 HNSW/IVF-PQ；实现题内增量库与 text→vector LRU 缓存。
