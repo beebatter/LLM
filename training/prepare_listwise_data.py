@@ -108,6 +108,8 @@ def build_groups(
     teacher_kind: Optional[str],
     teacher_tau: float,
     ce_scored_path: Optional[str],
+    groups_per_query: int = 1,
+    max_pos_per_group: Optional[int] = None,
 ) -> Iterable[dict]:
     random.seed(seed)
 
@@ -139,63 +141,77 @@ def build_groups(
         if len(pos) < min_positives:
             continue
 
-        # select up to k items, include all positives, fill with negatives
-        random.shuffle(pos)
-        random.shuffle(neg)
-        chosen = pos[:k]
-        if len(chosen) < k:
-            need = k - len(chosen)
-            chosen.extend(neg[:need])
+        # multi-group resampling per query
+        repeats = max(1, int(groups_per_query))
+        for rep in range(repeats):
+            # shuffle pools each time to resample
+            random.shuffle(pos)
+            random.shuffle(neg)
 
-        # If still short (small groups), just take what we have
-        cand = []
-        teacher_scores: List[Optional[float]] = []
-        for it in chosen:
-            q = it.get("query")
-            d = it.get("doc")
-            pn = it.get("problem_name") or ""
-            label = norm_label(it.get("label", 0))
-            weight = float(it.get("weight", 1.0))
-            meta = it.get("meta") or None
-            ce_score = None
-            if ce_scores:
-                ce_score = ce_scores.get((pn, q, d))
-                if ce_score is None:
-                    # try fallback by dropping pn
-                    ce_score = ce_scores.get(("", q, d))
-            cand.append({
-                "text": d,
-                "label": label,
-                "weight": weight,
-                "ce_score": ce_score,
-                "meta": meta,
-            })
-            teacher_scores.append(ce_score)
+            # choose positives (cap if needed)
+            if max_pos_per_group is not None and max_pos_per_group >= 0:
+                pos_take = min(len(pos), max_pos_per_group, k)
+            else:
+                pos_take = min(len(pos), k)
+            chosen = pos[:pos_take]
 
-        # Compute target distribution if requested and teacher available
-        target_scores = None
-        if teacher_kind == "ce" and any(s is not None for s in teacher_scores):
-            # fill missing with min score - margin for stability
-            filled = []
-            finite_vals = [s for s in teacher_scores if s is not None]
-            base = min(finite_vals) - 1.0 if finite_vals else 0.0
-            for s in teacher_scores:
-                filled.append(float(s) if s is not None else base)
-            target_scores = softmax(filled, tau=teacher_tau)
+            # fill with negatives up to k
+            if len(chosen) < k and len(neg) > 0:
+                need = k - len(chosen)
+                chosen.extend(neg[:need])
 
-        # unpack group key
-        try:
-            pn, q = key.split("||", 1)
-        except ValueError:
-            pn, q = "", key
+            # If still short (small pools), just take what we have
+            cand = []
+            teacher_scores: List[Optional[float]] = []
+            for it in chosen:
+                q = it.get("query")
+                d = it.get("doc")
+                pn = it.get("problem_name") or ""
+                label = norm_label(it.get("label", 0))
+                weight = float(it.get("weight", 1.0))
+                meta = it.get("meta") or None
+                ce_score = None
+                if ce_scores:
+                    ce_score = ce_scores.get((pn, q, d))
+                    if ce_score is None:
+                        # try fallback by dropping pn
+                        ce_score = ce_scores.get(("", q, d))
+                cand.append({
+                    "text": d,
+                    "label": label,
+                    "weight": weight,
+                    "ce_score": ce_score,
+                    "meta": meta,
+                })
+                teacher_scores.append(ce_score)
 
-        yield {
-            "problem_name": pn,
-            "query": q,
-            "group_id": key,
-            "candidates": cand,
-            "target_scores": target_scores,
-        }
+            # Compute target distribution if requested and teacher available
+            target_scores = None
+            if teacher_kind == "ce" and any(s is not None for s in teacher_scores):
+                # fill missing with min score - margin for stability
+                filled = []
+                finite_vals = [s for s in teacher_scores if s is not None]
+                base = min(finite_vals) - 1.0 if finite_vals else 0.0
+                for s in teacher_scores:
+                    filled.append(float(s) if s is not None else base)
+                target_scores = softmax(filled, tau=teacher_tau)
+
+            # unpack group key
+            try:
+                pn, q = key.split("||", 1)
+            except ValueError:
+                pn, q = "", key
+
+            # unique group id per repetition
+            gid = key if repeats == 1 else f"{key}##{rep}"
+
+            yield {
+                "problem_name": pn,
+                "query": q,
+                "group_id": gid,
+                "candidates": cand,
+                "target_scores": target_scores,
+            }
 
 
 def parse_args(argv=None):
@@ -208,6 +224,8 @@ def parse_args(argv=None):
     p.add_argument("--teacher", choices=["ce"], default=None, help="Which teacher to use for target_scores")
     p.add_argument("--tau", type=float, default=1.0, help="Temperature for teacher softmax")
     p.add_argument("--ce-scored", default=None, help="Optional ce_scored.*.jsonl for teacher scores")
+    p.add_argument("--groups-per-query", type=int, default=1, help="Create this many resampled groups per (problem,query)")
+    p.add_argument("--max-pos-per-group", type=int, default=-1, help="Cap positives per group to this number; -1 means no cap")
     return p.parse_args(argv)
 
 
@@ -221,6 +239,8 @@ def main(argv=None):
         teacher_kind=args.teacher,
         teacher_tau=args.tau,
         ce_scored_path=args.ce_scored,
+    groups_per_query=args.groups_per_query,
+    max_pos_per_group=(None if args.max_pos_per_group is None or args.max_pos_per_group < 0 else args.max_pos_per_group),
     )
     write_jsonl(args.output, rows)
     print(f"Wrote groups to {args.output}")

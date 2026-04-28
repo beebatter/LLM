@@ -24,13 +24,22 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
                 continue
             if not j.get("input"):
                 # Fallback to build a compact prompt on the fly
-                conj = j.get("conjecture", "")
+                # Accept both "conjecture" and "query" (our groups use "query")
+                conj = j.get("conjecture") or j.get("query") or ""
                 cands = j.get("candidates") or []
                 K = int(j.get("K") or len(cands))
                 lines = [f"[CONJECTURE]\n{conj}\n", f"[CANDIDATES] 共 {K} 条。每条：\n"]
                 for idx, c in enumerate(cands, start=1):
                     cid = c.get("id", idx)
-                    lines.append(f"- ID {cid}\n- TEXT: {c.get('text','')}\n- TAGS: {c.get('tags','')}")
+                    # Prefer explicit tags; otherwise render meta dict as flat tags
+                    tags_val = c.get('tags')
+                    if not tags_val:
+                        meta = c.get('meta') or {}
+                        try:
+                            tags_val = " ".join(f"<{k}={v}>" for k, v in meta.items() if v is not None)
+                        except Exception:
+                            tags_val = ""
+                    lines.append(f"- ID {cid}\n- TEXT: {c.get('text','')}\n- TAGS: {tags_val}")
                 prompt = "你是自动定理证明的子句打分器。只输出严格 JSON：{\"scores\":[...]}。\n" + "\n".join(lines)
             else:
                 prompt = j["input"]

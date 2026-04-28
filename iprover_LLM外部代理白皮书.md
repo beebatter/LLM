@@ -453,17 +453,7 @@ spm_train \
 - 调度：`Top‑M(cross)` + `Oldest M1` + `Lightest M2` + `ε 随机`。
 
 ---
-
-## 4) 方案 B：Bi‑Encoder SELECT + 本地大模型（DeepSeekMath‑32B, QLoRA）RERANK
-
-### 4.1 SELECT 同 3.1–3.2
-
-### 4.2 LLM RERANK（DeepSeekMath‑32B）微调
-- **数据**：`make_listwise_chunks.py` 产出的 **listwise**（窗口 64，目标为 softmax 分布）。  
-- **训练**：QLoRA（rank=16, α=32, lr=1e‑4, bf16）；目标为 **listwise CE/KL**；或先做 JSON‑SFT（输出 `{"scores":[...]}`），在线再 softmax。  
-- **推理**：vLLM/TGI/HF‑Transformers 任选；落在 `batch_ranker.py --backend llm_local`；解析失败→回退 Bi‑Encoder/启发式。  
-- **融合与调度**：同 3.4，`S = λ1·S_llm + λ2·S_bi + λ3·S_heur`。
-
+。。
 ---
 
 ## 5) 统一评测与对比指标
