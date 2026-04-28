@@ -136,7 +136,7 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--d-model", type=int, default=512)
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--heads", type=int, default=8)
-    ap.add_argument("--max-len", type=int, default=256)
+    ap.add_argument("--max-len", type=int, default=2048)
     ap.add_argument("--save", type=Path, default=Path("/home/ks/Training/models/biencoder_distill.pt"))
     ap.add_argument("--logdir", type=Path, default=Path("/home/ks/Training/logs/biencoder_distill"))
     ap.add_argument("--loss", type=str, choices=["mse", "kl"], default="mse")

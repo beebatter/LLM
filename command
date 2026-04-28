@@ -142,3 +142,23 @@ Traceback (most recent call last):
     chunk = conn.recv(8192)
             ^^^^^^^^^^^^^^^
 ConnectionResetError: [Errno 104] Connection reset by peer
+
+
+
+
+
+EA bi+ce:
+
+python -m LLM.ea.interactive_server serve   --host 127.0.0.1 --port 7320   --mode bi_then_cross   --bi-ckpt /root/autodl-tmp/Training/models/biencoder_distill_kl.pt   --cross-ckpt /root/autodl-tmp/Training/models/cross_encoder_listwise.pkl   --vocab /root/autodl-tmp/Training/models/spm_logic_24k.vocab   --topk 64   --device cuda   --bi-chunk-encode --bi-chunk-len 256 --bi-chunk-stride 192 --bi-chunk-max 4 --bi-chunk-agg mean   --max-len-override 256   --use-canonical   --auto-server-queries-end   --print-io   --delimiter newline --no-ack --verbose
+
+EA bi+LLM 32B
+python -m LLM.ea.interactive_server serve   --host 127.0.0.1   --port 7320   --mode bi_then_llm   --bi-ckpt /root/autodl-tmp/Training/models/biencoder_distill_kl.pt   --llm-model /root/autodl-tmp/models/Goedel-Prover-V2-32B   --topk 16   --device cuda   --bi-chunk-encode --bi-chunk-len 256 --bi-chunk-stride 192 --bi-chunk-max 4 --bi-chunk-agg mean   --use-canonical   --auto-server-queries-end   --print-io   --delimiter newline   --no-ack   --verbose
+
+EA bi+LLM 7B
+
+python -m LLM.ea.interactive_server serve --host 127.0.0.1 --port 7325 --mode bi_then_llm --bi-ckpt /root/autodl-tmp/Training/models/biencoder_distill_kl.pt --llm-model /root/autodl-tmp/models/DeepSeek-Prover-V2-7B --topk 16 --device cuda --bi-chunk-encode --bi-chunk-len 256 --bi-chunk-stride 192 --bi-chunk-max 4 --bi-chunk-agg mean --use-canonical --auto-server-queries-end --print-io --delimiter newline --no-ack --verbose
+
+
+iprover:
+
+./iproveropt   --interactive_mode true   --external_ip_address 127.0.0.1   --external_port 7325   --include_path /root/autodl-tmp/TPTP-v9.0.0   --schedule none   --preprocessing_flag false   --resolution_flag false   --instantiation_flag true   --superposition_flag true   --sup_iter_deepening 0   --comb_sup_deep_mult 0   --sup_passive_queue_type priority_queues   --sup_passive_queues '[[+external_score]]'   --sup_passive_queues_freq '[1]'   --inst_passive_queue_type priority_queues   --inst_passive_queues '[[+external_score]]'   --inst_passive_queues_freq '[1]'   /root/autodl-tmp/TPTP-v9.0.0/Problems/NUM/NUM322+1.p

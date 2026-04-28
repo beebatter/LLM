@@ -1,0 +1,219 @@
+0.07/0.12	% Problem  : theBenchmark.p : TPTP v0.0.0. Released v0.0.0.
+0.07/0.12	% Command  : run_iprover %s %d THM
+0.12/0.33	% Computer : n001.cluster.edu
+0.12/0.33	% Model    : x86_64 x86_64
+0.12/0.33	% CPU      : Intel(R) Xeon(R) CPU E5-2620 v4 @ 2.10GHz
+0.12/0.33	% Memory   : 8042.1875MB
+0.12/0.33	% OS       : Linux 3.10.0-693.el7.x86_64
+0.12/0.33	% CPULimit : 1440
+0.12/0.33	% WCLimit  : 180
+0.12/0.33	% DateTime : Thu Jul  4 05:12:09 EDT 2024
+0.12/0.33	% CPUTime  : 
+0.19/0.50	Running first-order theorem proving
+0.19/0.50	Running: /export/starexec/sandbox/solver/bin/run_problem --schedule fof_schedule --heuristic_context casc_unsat --no_cores 8 /export/starexec/sandbox/benchmark/theBenchmark.p 180
+90.76/12.89	% SZS status Started for theBenchmark.p
+90.76/12.89	% SZS status Theorem for theBenchmark.p
+90.76/12.89	
+90.76/12.89	%---------------- iProver v3.9 (pre CASC 2024/SMT-COMP 2024) ----------------%
+90.76/12.89	
+90.76/12.89	------  iProver source info
+90.76/12.89	
+90.76/12.89	git: date: 2024-06-12 09:56:46 +0000
+90.76/12.89	git: sha1: 4869ab62f0a3398f9d3a35e6db7918ebd3847e49
+90.76/12.89	git: non_committed_changes: false
+90.76/12.89	
+90.76/12.89	------ Parsing...
+90.76/12.89	------ Clausification by vclausify_rel  & Parsing by iProver...
+90.76/12.89	
+90.76/12.89	------ Preprocessing...
+90.76/12.89	
+90.76/12.89	------ Preprocessing...
+90.76/12.89	
+90.76/12.89	------ Preprocessing...
+90.76/12.89	------ Proving...
+90.76/12.89	------ Problem Properties 
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	clauses                                 461
+90.76/12.89	conjectures                             1
+90.76/12.89	EPR                                     6
+90.76/12.89	Horn                                    426
+90.76/12.89	unary                                   130
+90.76/12.89	binary                                  222
+90.76/12.89	lits                                    945
+90.76/12.89	lits eq                                 130
+90.76/12.89	fd_pure                                 0
+90.76/12.89	fd_pseudo                               0
+90.76/12.89	fd_cond                                 0
+90.76/12.89	fd_pseudo_cond                          28
+90.76/12.89	AC symbols                              0
+90.76/12.89	
+90.76/12.89	------ Input Options Time Limit: Unbounded
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	------ 
+90.76/12.89	Current options:
+90.76/12.89	------ 
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	------ Proving...
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	% SZS status Theorem for theBenchmark.p
+90.76/12.89	
+90.76/12.89	% SZS output start CNFRefutation for theBenchmark.p
+90.76/12.89	
+90.76/12.89	fof(f93,axiom,(
+90.76/12.89	  hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,g),image_pname_a(mgt_call,u)))),
+90.76/12.89	  file('/export/starexec/sandbox/benchmark/theBenchmark.p',conj_1)).
+90.76/12.89	
+90.76/12.89	fof(f155,axiom,(
+90.76/12.89	  hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,pn),u))),
+90.76/12.89	  file('/export/starexec/sandbox/benchmark/theBenchmark.p',conj_4)).
+90.76/12.89	
+90.76/12.89	fof(f208,conjecture,(
+90.76/12.89	  hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(hAPP_pname_a(mgt_call,pn),g)),image_pname_a(mgt_call,u)))),
+90.76/12.89	  file('/export/starexec/sandbox/benchmark/theBenchmark.p',conj_6)).
+90.76/12.89	
+90.76/12.89	fof(f209,negated_conjecture,(
+90.76/12.89	  ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(hAPP_pname_a(mgt_call,pn),g)),image_pname_a(mgt_call,u)))),
+90.76/12.89	  inference(negated_conjecture,[],[f208])).
+90.76/12.89	
+90.76/12.89	fof(f218,axiom,(
+90.76/12.89	  ! [X27,X28] : insert_a(X27,X28) = collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),X27)),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),X28)))),
+90.76/12.89	  file('/export/starexec/sandbox/benchmark/theBenchmark.p',fact_265_insert__compr__raw)).
+90.76/12.89	
+90.76/12.89	fof(f302,axiom,(
+90.76/12.89	  ! [X7,X8,X20] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X7,X8)),X20)) <=> (hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X7),X20)) & hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X8),X20))))),
+90.76/12.89	  file('/export/starexec/sandbox/benchmark/theBenchmark.p',fact_274_insert__subset)).
+90.76/12.89	
+90.76/12.89	fof(f448,axiom,(
+90.76/12.89	  ! [X8,X12,X9,X7] : (hAPP_pname_a(X9,X7) = X12 => (hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X7),X8)) => hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X12),image_pname_a(X9,X8)))))),
+90.76/12.89	  file('/export/starexec/sandbox/benchmark/theBenchmark.p',fact_176_image__eqI)).
+90.76/12.89	
+90.76/12.89	fof(f646,plain,(
+90.76/12.89	  ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(hAPP_pname_a(mgt_call,pn),g)),image_pname_a(mgt_call,u)))),
+90.76/12.89	  inference(flattening,[],[f209])).
+90.76/12.89	
+90.76/12.89	fof(f654,plain,(
+90.76/12.89	  ! [X0,X1] : insert_a(X0,X1) = collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),X0)),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),X1)))),
+90.76/12.89	  inference(rectify,[],[f218])).
+90.76/12.89	
+90.76/12.89	fof(f734,plain,(
+90.76/12.89	  ! [X0,X1,X2] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X0,X1)),X2)) <=> (hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) & hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2))))),
+90.76/12.89	  inference(rectify,[],[f302])).
+90.76/12.89	
+90.76/12.89	fof(f867,plain,(
+90.76/12.89	  ! [X0,X1,X2,X3] : (hAPP_pname_a(X2,X3) = X1 => (hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X3),X0)) => hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X1),image_pname_a(X2,X0)))))),
+90.76/12.89	  inference(rectify,[],[f448])).
+90.76/12.89	
+90.76/12.89	fof(f1235,plain,(
+90.76/12.89	  ! [X0,X1,X2,X3] : ((hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X1),image_pname_a(X2,X0))) | ~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X3),X0))) | hAPP_pname_a(X2,X3) != X1)),
+90.76/12.89	  inference(ennf_transformation,[],[f867])).
+90.76/12.89	
+90.76/12.89	fof(f1236,plain,(
+90.76/12.89	  ! [X0,X1,X2,X3] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X1),image_pname_a(X2,X0))) | ~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X3),X0)) | hAPP_pname_a(X2,X3) != X1)),
+90.76/12.89	  inference(flattening,[],[f1235])).
+90.76/12.89	
+90.76/12.89	fof(f1301,plain,(
+90.76/12.89	  ! [X0,X1,X2] : ((hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X0,X1)),X2)) | (~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2)))) & ((hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) & hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2))) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X0,X1)),X2))))),
+90.76/12.89	  inference(nnf_transformation,[],[f734])).
+90.76/12.89	
+90.76/12.89	fof(f1302,plain,(
+90.76/12.89	  ! [X0,X1,X2] : ((hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X0,X1)),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2))) & ((hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) & hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2))) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X0,X1)),X2))))),
+90.76/12.89	  inference(flattening,[],[f1301])).
+90.76/12.89	
+90.76/12.89	fof(f1445,plain,(
+90.76/12.89	  hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,g),image_pname_a(mgt_call,u)))),
+90.76/12.89	  inference(cnf_transformation,[],[f93])).
+90.76/12.89	
+90.76/12.89	fof(f1518,plain,(
+90.76/12.89	  hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,pn),u))),
+90.76/12.89	  inference(cnf_transformation,[],[f155])).
+90.76/12.89	
+90.76/12.89	fof(f1584,plain,(
+90.76/12.89	  ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(hAPP_pname_a(mgt_call,pn),g)),image_pname_a(mgt_call,u)))),
+90.76/12.89	  inference(cnf_transformation,[],[f646])).
+90.76/12.89	
+90.76/12.89	fof(f1593,plain,(
+90.76/12.89	  ( ! [X0,X1] : (insert_a(X0,X1) = collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),X0)),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),X1)))) )),
+90.76/12.89	  inference(cnf_transformation,[],[f654])).
+90.76/12.89	
+90.76/12.89	fof(f1697,plain,(
+90.76/12.89	  ( ! [X2,X0,X1] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,insert_a(X0,X1)),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2))) )),
+90.76/12.89	  inference(cnf_transformation,[],[f1302])).
+90.76/12.89	
+90.76/12.89	fof(f1881,plain,(
+90.76/12.89	  ( ! [X2,X3,X0,X1] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X1),image_pname_a(X2,X0))) | ~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X3),X0)) | hAPP_pname_a(X2,X3) != X1) )),
+90.76/12.89	  inference(cnf_transformation,[],[f1236])).
+90.76/12.89	
+90.76/12.89	fof(f1955,plain,(
+90.76/12.89	  ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),hAPP_pname_a(mgt_call,pn))),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),g)))),image_pname_a(mgt_call,u)))),
+90.76/12.89	  inference(definition_unfolding,[],[f1584,f1593])).
+90.76/12.89	
+90.76/12.89	fof(f1975,plain,(
+90.76/12.89	  ( ! [X2,X0,X1] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),X0)),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),X1)))),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X2)) | ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),X2))) )),
+90.76/12.89	  inference(definition_unfolding,[],[f1697,f1593])).
+90.76/12.89	
+90.76/12.89	fof(f2059,plain,(
+90.76/12.89	  ( ! [X2,X3,X0] : (hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,hAPP_pname_a(X2,X3)),image_pname_a(X2,X0))) | ~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X3),X0))) )),
+90.76/12.89	  inference(equality_resolution,[],[f1881])).
+90.76/12.89	
+90.76/12.89	cnf(c_155,plain,
+90.76/12.89	    (hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,g),image_pname_a(mgt_call,u)))),
+90.76/12.89	    inference(cnf_transformation,[],[f1445])).
+90.76/12.89	
+90.76/12.89	cnf(c_226,plain,
+90.76/12.89	    (hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,pn),u))),
+90.76/12.89	    inference(cnf_transformation,[],[f1518])).
+90.76/12.89	
+90.76/12.89	cnf(c_292,negated_conjecture,
+90.76/12.89	    (~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),hAPP_pname_a(mgt_call,pn))),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),g)))),image_pname_a(mgt_call,u)))),
+90.76/12.89	    inference(cnf_transformation,[],[f1955])).
+90.76/12.89	
+90.76/12.89	cnf(c_401,plain,
+90.76/12.89	    (~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,X0),X1))|
+90.76/12.89	    ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X2),X1))|
+90.76/12.89	    hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),X0)),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),X2)))),X1))),
+90.76/12.89	    inference(cnf_transformation,[],[f1975])).
+90.76/12.89	
+90.76/12.89	cnf(c_581,plain,
+90.76/12.89	    (~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,X0),X1))|
+90.76/12.89	    hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,hAPP_pname_a(X2,X0)),image_pname_a(X2,X1)))),
+90.76/12.89	    inference(cnf_transformation,[],[f2059])).
+90.76/12.89	
+90.76/12.89	cnf(c_10934,plain,
+90.76/12.89	    (~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,hAPP_pname_a(X0,pn)),image_pname_a(X0,u)))|
+90.76/12.89	    ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,X1),image_pname_a(X0,u)))|
+90.76/12.89	    hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),hAPP_pname_a(X0,pn))),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),X1)))),image_pname_a(X0,u)))),
+90.76/12.89	    inference(instantiation,[status(thm)],[c_401])).
+90.76/12.89	
+90.76/12.89	cnf(c_15104,plain,
+90.76/12.89	    (~hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,hAPP_pname_a(mgt_call,pn)),image_pname_a(mgt_call,u)))|
+90.76/12.89	    ~hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,g),image_pname_a(mgt_call,u)))|
+90.76/12.89	    hBOOL(hAPP_fun_a_bool_bool(hAPP_f1631501043l_bool(ord_le1311769555a_bool,collect_a(cOMBS_a_bool_bool(cOMBB_1972296269bool_a(fdisj,hAPP_a_fun_a_bool(cOMBC_a_a_bool(fequal_a),hAPP_pname_a(mgt_call,pn))),hAPP_f2050579477a_bool(cOMBC_1355376034l_bool(member_a),g)))),image_pname_a(mgt_call,u)))),
+90.76/12.89	    inference(instantiation,[status(thm)],[c_10934])).
+90.76/12.89	
+90.76/12.89	cnf(c_48275,plain,
+90.76/12.89	    (~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,pn),u))|
+90.76/12.89	    hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,hAPP_pname_a(X0,pn)),image_pname_a(X0,u)))),
+90.76/12.89	    inference(instantiation,[status(thm)],[c_581])).
+90.76/12.89	
+90.76/12.89	cnf(c_64139,plain,
+90.76/12.89	    (~hBOOL(hAPP_f1664156314l_bool(hAPP_p338031245l_bool(member_pname,pn),u))|
+90.76/12.89	    hBOOL(hAPP_fun_a_bool_bool(hAPP_a85458249l_bool(member_a,hAPP_pname_a(mgt_call,pn)),image_pname_a(mgt_call,u)))),
+90.76/12.89	    inference(instantiation,[status(thm)],[c_48275])).
+90.76/12.89	
+90.76/12.89	cnf(c_64140,plain,
+90.76/12.89	    ($false),
+90.76/12.89	    inference(prop_impl_just,
+90.76/12.89	              [status(thm)],
+90.76/12.89	              [c_64139,c_15104,c_292,c_155,c_226])).
+90.76/12.89	
+90.76/12.89	
+90.76/12.89	% SZS output end CNFRefutation for theBenchmark.p
+90.76/12.89	
+90.76/12.90	
+90.76/12.91	EOF
