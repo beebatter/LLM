@@ -1,4 +1,3 @@
-"""EA subpackage: external agent servers and scoring backends for iProver interactive mode."""
-__all__ = [
-    'interactive_server_minimal', 'interactive_server_unified', 'backends',
-]
+"""Legacy iProver external-agent code awaiting a GNN protocol rewrite."""
+
+__all__ = ["interactive_server", "iprover_client_example", "backends"]

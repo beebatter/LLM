@@ -6,8 +6,6 @@ from .logic_tokenizer import (
     wrap_d,
     PrefixBuckets,
 )
-from .datasets import BiEncoderDataset, CrossEncoderDataset
-
 __all__ = [
     "LogicSentencePiece",
     "normalize_text",
@@ -15,6 +13,4 @@ __all__ = [
     "wrap_q",
     "wrap_d",
     "PrefixBuckets",
-    "BiEncoderDataset",
-    "CrossEncoderDataset",
 ]
