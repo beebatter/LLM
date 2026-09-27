@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -1744,8 +1745,8 @@ def _ea_handle_scores_req(state: _EAState, msg: Dict[str, Any], args, log_fp=Non
 def run_ea_server(host: str, port: int, args) -> None:
     import socket, threading, json, sys, os, time
     state = _EAState()
-    # Hard-code unified logs root and derive a per-run directory
-    LOGS_ROOT = "/home/ks/LLM/Logs"
+    # Use an explicit environment override when provided; otherwise keep logs inside the repository.
+    LOGS_ROOT = os.getenv("EA_LOG_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logs")
     run_dir = os.path.join(LOGS_ROOT, f"EA.{port}.{int(time.time())}")
     os.makedirs(run_dir, exist_ok=True)
 
@@ -2000,7 +2001,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_srv = sub.add_parser("serve", help="Run EA server for iProver interactive mode")
     p_srv.add_argument('--host', type=str, default='127.0.0.1')
     p_srv.add_argument('--port', type=int, default=12345)
-    p_srv.add_argument('--ranker-script', type=str, default='/home/ks/LLM/batch_ranker.py', help='Path to batch_ranker.py')
+    p_srv.add_argument('--ranker-script', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'batch_ranker.py'), help='Path to batch_ranker.py')
     p_srv.add_argument('--python-exec', dest='python_exec', type=str, default=None,
                        help='Python interpreter to run the ranker (default: same as EA sys.executable)')
     p_srv.add_argument('--model', type=str, default='gpt-5', help='LLM model for ranking (passed to ranker)')
